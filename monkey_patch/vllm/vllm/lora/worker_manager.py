@@ -3,11 +3,51 @@
 from collections.abc import Iterable
 
 from vllm.logger import init_logger
-from vllm.lora.worker_manager import WorkerLoRAManager
+from vllm.lora.worker_manager import (
+    LRUCacheWorkerLoRAManager,
+    WorkerLoRAManager,
+)
 
 logger = init_logger(__name__)
 
 ORIGINAL_LOAD_ADAPTER = WorkerLoRAManager._load_adapter
+ORIGINAL_CREATE_LORA_MANAGER = WorkerLoRAManager.create_lora_manager
+ORIGINAL_LRU_CREATE_LORA_MANAGER = (
+    LRUCacheWorkerLoRAManager.create_lora_manager
+)
+
+
+def _enable_language_model_expand_slice(manager) -> None:
+    if not getattr(manager, "supports_mm", False):
+        return
+
+    wrapper_mapping = getattr(manager, "punica_wrapper_mapping", {})
+    language_prefixes = getattr(
+        getattr(manager, "mm_mapping", None),
+        "language_model",
+        (),
+    )
+    for prefix in language_prefixes:
+        wrapper = wrapper_mapping.get(prefix)
+        enable = getattr(
+            wrapper,
+            "enable_compatible_lora_bmm_expand_slice",
+            None,
+        )
+        if enable is not None:
+            enable()
+
+
+def create_lora_manager(self, model, vllm_config=None):
+    model = ORIGINAL_CREATE_LORA_MANAGER(self, model, vllm_config)
+    _enable_language_model_expand_slice(self._adapter_manager)
+    return model
+
+
+def create_lora_manager_lru(self, model, vllm_config=None):
+    model = ORIGINAL_LRU_CREATE_LORA_MANAGER(self, model, vllm_config)
+    _enable_language_model_expand_slice(self._adapter_manager)
+    return model
 
 
 def _detect_language_model_prefix(
@@ -71,4 +111,3 @@ def load_adapter(self, lora_request):
             error,
         )
     return lora
-

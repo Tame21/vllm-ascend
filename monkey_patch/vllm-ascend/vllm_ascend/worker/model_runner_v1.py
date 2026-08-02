@@ -130,7 +130,7 @@ def assign_graph_param_functions(
     set_graph_params: Callable[..., Any],
     set_draft_graph_params: Callable[..., Any],
 ) -> None:
-    """Refresh aliases that were imported before register_func ran."""
+    """Refresh aliases imported before TurboManager applied the patches."""
     imported_model_runner = sys.modules.get(
         "vllm_ascend.worker.model_runner_v1"
     )
