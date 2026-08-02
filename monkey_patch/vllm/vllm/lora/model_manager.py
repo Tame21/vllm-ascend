@@ -1,5 +1,6 @@
 """LoRAModelManager replacement for wrapped Qwen3.5 language models."""
 
+from functools import wraps
 from typing import Any
 
 from vllm.lora.model_manager import LoRAModelManager
@@ -32,7 +33,12 @@ def _enable_language_model_expand_slice(manager: Any) -> None:
             seen_wrappers.add(id(wrapper))
 
 
-def init(self, *args, **kwargs) -> None:
-    ORIGINAL_INIT(self, *args, **kwargs)
-    _enable_language_model_expand_slice(self)
+def init_wrapper(original_init):
+    """Wrap LoRAModelManager.__init__ and run post-init setup."""
 
+    @wraps(original_init)
+    def wrapped_init(self, *args, **kwargs) -> None:
+        original_init(self, *args, **kwargs)
+        _enable_language_model_expand_slice(self)
+
+    return wrapped_init
