@@ -2,6 +2,7 @@
 
 import inspect
 from contextlib import contextmanager, nullcontext
+from functools import wraps
 from types import FunctionType, MethodType
 from typing import Any
 
@@ -75,8 +76,9 @@ def _variant_compile_options(
     return options
 
 
-def init(
+def _init_impl(
     self: Any,
+    original_init,
     compile_prefix: str = "",
     is_encoder: bool = False,
 ) -> None:
@@ -95,13 +97,13 @@ def init(
 
     if specialize_lora:
         with _without_bytecode_hook():
-            ORIGINAL_INIT(
+            original_init(
                 self,
                 compile_prefix=compile_prefix,
                 is_encoder=is_encoder,
             )
     else:
-        ORIGINAL_INIT(
+        original_init(
             self,
             compile_prefix=compile_prefix,
             is_encoder=is_encoder,
@@ -151,6 +153,25 @@ def init(
             self.evaluate_guards,
         ),
     )
+
+
+def init_wrapper(original_init):
+    """Wrap TorchCompileWithNoGuardsWrapper.__init__."""
+
+    @wraps(original_init)
+    def wrapped_init(
+        self: Any,
+        compile_prefix: str = "",
+        is_encoder: bool = False,
+    ) -> None:
+        _init_impl(
+            self,
+            original_init,
+            compile_prefix=compile_prefix,
+            is_encoder=is_encoder,
+        )
+
+    return wrapped_init
 
 
 # These methods do not exist in v0.23 and are attached by direct assignment.
@@ -267,4 +288,3 @@ def call(self: Any, *args: Any, **kwargs: Any) -> Any:
             *args,
             **kwargs,
         )
-
