@@ -83,6 +83,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     UniformTypeKVCacheSpecs,
 )
+from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm.v1.outputs import (
     EMPTY_MODEL_RUNNER_OUTPUT,
     AsyncModelRunnerOutput,
@@ -143,6 +144,7 @@ from vllm_ascend.distributed.kv_transfer.sparse_kv_offload.sparse_kv_offload_man
     update_sparse_kv_offload_metadata,
 )
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_world_size
+from vllm_ascend.device.mxfp_compat import MXFP8_GROUP_SIZE
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -181,6 +183,7 @@ from vllm_ascend.utils import (
     get_ascend_device_type,
     get_c_env,
     global_stream,
+    is_c8_mxfp_kv_quant,
     is_hidden_state_cache_spec,
     kv_cache_spec_uses_sparse_sfa_c8,
     lmhead_tp_enable,
@@ -3737,6 +3740,9 @@ class NPUModelRunner(GPUModelRunner):
                 module._ascend_routed_experts_capturer = capturer
                 module.routed_experts._ascend_routed_experts_capturer = capturer
 
+    def _is_c8_mxfp_kv_cache(self, kv_cache_spec: AttentionSpec) -> bool:
+        return isinstance(kv_cache_spec, FullAttentionSpec) and is_c8_mxfp_kv_quant(self.vllm_config)
+
     def _align_memory(self, tensor: torch.Tensor, alignment: int) -> torch.Tensor:
         data_ptr = tensor.data_ptr()
         aligned_addr = (data_ptr + alignment - 1) // alignment * alignment
@@ -4056,6 +4062,7 @@ class NPUModelRunner(GPUModelRunner):
                     current_sparse_sfa_c8 = self.use_sparse and kv_cache_spec_uses_sparse_sfa_c8(
                         current_kv_cache_spec
                     )
+                    k_scale_tensor = v_scale_tensor = None
 
                     if current_sparse_sfa_c8:
                         k_tensor_size = kv_cache_tensor.size
@@ -4070,6 +4077,23 @@ class NPUModelRunner(GPUModelRunner):
                         if not self.use_sparse and enable_fa_quant(self.vllm_config):
                             k_tensor_split_factor, v_tensor_split_factor = (
                                 self.vllm_config.quant_config.get_kv_quant_split_factor(layer_name, kv_head_dim_list)
+                            )
+                        elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                            ori_k_dim = k_dim // (1 + MXFP8_GROUP_SIZE) * MXFP8_GROUP_SIZE
+                            ori_v_dim = v_dim // (1 + MXFP8_GROUP_SIZE) * MXFP8_GROUP_SIZE
+                            split_dims = [
+                                ori_k_dim,
+                                ori_v_dim,
+                                ori_k_dim // MXFP8_GROUP_SIZE,
+                                ori_v_dim // MXFP8_GROUP_SIZE,
+                            ]
+                            k_split, v_split, k_scale_split, v_scale_split = calc_split_factor(split_dims)
+                            k_tensor_split_factor, v_tensor_split_factor = k_split, v_split
+                            k_scale_tensor = self._allocate_int8_cache_tensor(
+                                int(kv_cache_tensor.size // k_scale_split), alignment
+                            )
+                            v_scale_tensor = self._allocate_int8_cache_tensor(
+                                int(kv_cache_tensor.size // v_scale_split), alignment
                             )
                         else:
                             k_tensor_split_factor, v_tensor_split_factor = calc_split_factor(kv_head_dim_list)
@@ -4109,6 +4133,14 @@ class NPUModelRunner(GPUModelRunner):
                         if "attn" in layer_name_inner and "linear_attn" not in layer_name_inner:
                             if current_sparse_sfa_c8:
                                 kv_cache_raw_tensors[layer_name_inner] = (k_tensor,)
+                            elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                                assert v_tensor is not None and k_scale_tensor is not None and v_scale_tensor is not None
+                                kv_cache_raw_tensors[layer_name_inner] = (
+                                    k_tensor,
+                                    v_tensor,
+                                    k_scale_tensor,
+                                    v_scale_tensor,
+                                )
                             else:
                                 assert v_tensor is not None
                                 kv_cache_raw_tensors[layer_name_inner] = (k_tensor, v_tensor)
@@ -4307,6 +4339,16 @@ class NPUModelRunner(GPUModelRunner):
                         else:
                             raw_k_tensor, raw_v_tensor = raw_cache
                             sum_page_size_bytes = raw_k_tensor.numel() + raw_v_tensor.numel()
+                    elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                        raw_k_tensor, raw_v_tensor, raw_k_scale_tensor, raw_v_scale_tensor = kv_cache_raw_tensors[
+                            layer_name
+                        ]
+                        sum_page_size_bytes = (
+                            raw_k_tensor.numel()
+                            + raw_v_tensor.numel()
+                            + raw_k_scale_tensor.numel()
+                            + raw_v_scale_tensor.numel()
+                        )
                     elif (
                         self.use_hybrid_blocks
                         and self.hybrid_with_attn_and_mamba
@@ -4411,7 +4453,10 @@ class NPUModelRunner(GPUModelRunner):
                             current_kv_cache_spec.num_kv_heads,
                             current_kv_cache_spec.head_size,
                         )
-                    if not isinstance(current_kv_cache_spec, AscendMLAAttentionSpec):
+                    if self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                        k_shape = (*kv_cache_shape[1:-1], self.model_config.hf_text_config.head_dim)
+                        v_shape = k_shape
+                    elif not isinstance(current_kv_cache_spec, AscendMLAAttentionSpec):
                         k_shape = kv_cache_shape[1:]
                         if hasattr(current_kv_cache_spec, "head_size_v"):
                             v_shape = (*kv_cache_shape[1:-1], current_kv_cache_spec.head_size_v)
@@ -4459,6 +4504,12 @@ class NPUModelRunner(GPUModelRunner):
 
                     if current_sparse_sfa_c8:
                         kv_caches[layer_name] = (k_cache,)
+                    elif self._is_c8_mxfp_kv_cache(current_kv_cache_spec):
+                        k_scale_cache_shape = (k_shape[0], k_shape[2], k_shape[1], k_shape[3] // 64, 2)
+                        v_scale_cache_shape = (v_shape[0], v_shape[2], v_shape[1] // 64, v_shape[3], 2)
+                        k_scale_cache = raw_k_scale_tensor.view(torch.uint8).view(k_scale_cache_shape)
+                        v_scale_cache = raw_v_scale_tensor.view(torch.uint8).view(v_scale_cache_shape)
+                        kv_caches[layer_name] = (k_cache, v_cache, k_scale_cache, v_scale_cache)
                     else:
                         assert v_cache is not None
                         kv_caches[layer_name] = (k_cache, v_cache)
@@ -4736,7 +4787,16 @@ class NPUModelRunner(GPUModelRunner):
                     kv_cache_spec[layer_name] = spec
             elif isinstance(attn_module, Attention):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
-                    kv_cache_spec[layer_name] = spec
+                    if self._is_c8_mxfp_kv_cache(spec):
+                        head_size = spec.head_size + spec.head_size // MXFP8_GROUP_SIZE
+                        kv_cache_spec[layer_name] = FullAttentionSpec(
+                            block_size=spec.block_size,
+                            num_kv_heads=spec.num_kv_heads,
+                            head_size=head_size,
+                            dtype=torch.float8_e4m3fn,
+                        )
+                    else:
+                        kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
 
             elif isinstance(attn_module, MLAAttention):

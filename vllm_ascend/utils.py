@@ -1176,6 +1176,13 @@ def has_layer_idx(model_instance: torch.nn.Module) -> bool:
     return _HAS_LAYER_IDX
 
 
+A5_C8_MXFP_KV_CACHE_BLOCK_SIZE = 512
+
+
+def is_c8_mxfp_kv_quant(vllm_config: VllmConfig) -> bool:
+    return vllm_config.quant_config is not None and vllm_config.quant_config.enable_mxfp_c8_quant
+
+
 def refresh_block_size(vllm_config):
     """
     Refresh the block size in cache config.
@@ -1185,6 +1192,16 @@ def refresh_block_size(vllm_config):
     model_config = vllm_config.model_config
 
     if not cache_config:
+        return
+
+    if is_c8_mxfp_kv_quant(vllm_config):
+        if cache_config.block_size != A5_C8_MXFP_KV_CACHE_BLOCK_SIZE:
+            logger.info(
+                "Ascend A5 with C8_MXFP KV cache requires block_size=%s; overriding block_size from %s.",
+                A5_C8_MXFP_KV_CACHE_BLOCK_SIZE,
+                cache_config.block_size,
+            )
+            cache_config.block_size = A5_C8_MXFP_KV_CACHE_BLOCK_SIZE
         return
 
     if cache_config.block_size is None:
