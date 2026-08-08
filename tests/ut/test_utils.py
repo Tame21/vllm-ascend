@@ -34,6 +34,14 @@ class TestUtils(TestBase):
         importlib.reload(platform)
         utils.enable_dsa_cp_with_o_proj_tp.cache_clear()
 
+    def test_is_c8_mxfp_kv_quant_handles_other_quant_configs(self):
+        vllm_config = mock.Mock()
+        vllm_config.quant_config = object()
+        self.assertFalse(utils.is_c8_mxfp_kv_quant(vllm_config))
+
+        vllm_config.quant_config = mock.Mock(enable_mxfp_c8_quant=True)
+        self.assertTrue(utils.is_c8_mxfp_kv_quant(vllm_config))
+
     def test_nd_to_nz_2d(self):
         # can be divided by 16
         input_tensor = torch.randn(32, 64)

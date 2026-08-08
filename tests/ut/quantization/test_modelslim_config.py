@@ -156,6 +156,30 @@ class TestAscendModelSlimConfig(TestBase):
 
             self.assertIsInstance(args[0], AscendC8KVCacheAttentionMethod)
 
+    def test_get_quant_method_for_mxfp_c8_kv_cache_attention(self):
+        config = AscendModelSlimConfig(
+            {"kv_cache_type": "K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL"}
+        )
+        attention_layer = MagicMock(spec=AttentionLayerBase)
+        mock_vllm_config = MagicMock()
+        mock_vllm_config.model_config.hf_config.model_type = None
+
+        with (
+            patch("vllm_ascend.quantization.modelslim_config.get_current_vllm_config", return_value=mock_vllm_config),
+            patch("vllm_ascend.quantization.methods.mxfp_c8.ensure_mxfp8_linear_available"),
+            patch(
+                "vllm_ascend.quantization.method_adapters.AscendKVCacheMethod",
+                return_value=MagicMock(),
+            ) as mock_kvcache,
+        ):
+            method = config.get_quant_method(attention_layer, "model.layers.0.self_attn.attn")
+
+        self.assertIs(method, mock_kvcache.return_value)
+        args, _ = mock_kvcache.call_args
+        from vllm_ascend.quantization.methods.mxfp_c8 import AscendC8MXFPKVCacheAttentionMethod
+
+        self.assertIsInstance(args[0], AscendC8MXFPKVCacheAttentionMethod)
+
     def test_is_layer_skipped_ascend(self):
         # Test non-fused layer that should be quantized
         self.assertFalse(self.ascend_config.is_layer_skipped_ascend("layer1"))
@@ -528,6 +552,14 @@ class TestQuantPrefixMapper(TestBase):
 
 
 class TestGetKvQuantDtype(TestBase):
+    def test_enable_mxfp_c8_quant(self):
+        config = AscendModelSlimConfig(
+            {"kv_cache_type": "K_DYNAMIC_V_STATIC_MXFP8_PER_CHANNEL"}
+        )
+        k_dtype, v_dtype = config.get_kv_quant_dtype("layers.1.attn", torch.float16, MagicMock())
+        self.assertEqual(k_dtype, torch.float8_e4m3fn)
+        self.assertEqual(v_dtype, torch.float8_e4m3fn)
+
     def test_enable_fa_quant(self):
         config = AscendModelSlimConfig(
             {
