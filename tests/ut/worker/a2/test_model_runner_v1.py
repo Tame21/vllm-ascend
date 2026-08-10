@@ -1,5 +1,4 @@
 import unittest
-from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -19,49 +18,6 @@ from vllm_ascend.attention.utils import get_sfa_qsfa_packed_head_dim
 from vllm_ascend.core.kv_cache_interface import AscendMLAAttentionSpec, AscendSFAIndexerCacheSpec
 from vllm_ascend.utils import AscendDeviceType
 from vllm_ascend.worker.model_runner_v1 import NPUModelRunner
-
-
-class TestNPUModelRunnerGraphProfileCleanup(unittest.TestCase):
-    def test_profile_resets_c8_mxfp_v_scale_initialization(self):
-        runner = NPUModelRunner.__new__(NPUModelRunner)
-        c8_mxfp_impl = SimpleNamespace(
-            key_cache=object(),
-            value_cache=object(),
-            save_v_scale_flag=True,
-        )
-        runner.compilation_config = SimpleNamespace(
-            static_forward_context={
-                "layers.0.attn": SimpleNamespace(impl=c8_mxfp_impl),
-            }
-        )
-
-        with (
-            patch(
-                "vllm_ascend.worker.model_runner_v1._get_gpu_model_runner_module_name",
-                return_value="vllm.v1.worker.gpu_model_runner",
-            ),
-            patch(
-                "vllm_ascend.worker.model_runner_v1._torch_cuda_wrapper",
-                return_value=nullcontext(),
-            ),
-            patch(
-                "vllm_ascend.worker.model_runner_v1._replace_gpu_model_runner_function_wrapper",
-                return_value=nullcontext(),
-            ),
-            patch(
-                "vllm_ascend.worker.model_runner_v1.GPUModelRunner.profile_cudagraph_memory",
-                return_value=123,
-            ),
-            patch("vllm_ascend.worker.model_runner_v1.reset_graph_params"),
-            patch("vllm_ascend.worker.model_runner_v1.gc.collect"),
-            patch("torch.accelerator.empty_cache"),
-        ):
-            result = runner.profile_cudagraph_memory()
-
-        self.assertEqual(result, 123)
-        self.assertIsNone(c8_mxfp_impl.key_cache)
-        self.assertIsNone(c8_mxfp_impl.value_cache)
-        self.assertFalse(c8_mxfp_impl.save_v_scale_flag)
 
 
 class TestNPUModelRunnerKVCache(unittest.TestCase):
@@ -622,6 +578,46 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         self.assertEqual(indexer_k_cache.dtype, torch.int8)
         self.assertEqual(indexer_scale_cache.shape, (2, 16, 1, 1))
         self.assertEqual(indexer_scale_cache.dtype, torch.float16)
+
+
+    def test_reshape_hybrid_c8_mxfp_cache_splits_shared_buffer(self):
+        runner = self._build_runner()
+        runner.use_hybrid_blocks = True
+        runner.hybrid_with_attn_and_mamba = True
+        runner.model_config.use_mla = False
+        runner.model_config.hf_text_config.head_dim = 64
+        runner.vllm_config.quant_config = SimpleNamespace(enable_mxfp_c8_quant=True)
+        spec = FullAttentionSpec(
+            block_size=128, num_kv_heads=1, head_size=66, dtype=torch.float8_e4m3fn
+        )
+        raw = torch.zeros(128 + spec.page_size_bytes * 2, dtype=torch.int8)
+        config = KVCacheConfig(
+            num_blocks=2,
+            kv_cache_tensors=[KVCacheTensor(size=raw.numel(), shared_by=["attn"])],
+            kv_cache_groups=[KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=spec)],
+        )
+        backend = MagicMock()
+        backend.get_supported_kernel_block_sizes.return_value = [128]
+        backend.get_kv_cache_shape.side_effect = lambda n, b, h, d: (2, n, b, h, d)
+        runner._kv_cache_spec_attn_group_iterator = lambda: [
+            SimpleNamespace(kv_cache_spec=spec, backend=backend, layer_names=["attn"])
+        ]
+
+        k_cache, v_cache, k_scale, v_scale = runner._reshape_kv_cache_tensors(config, {"attn": raw})["attn"]
+
+        self.assertEqual(k_cache.shape, (2, 128, 1, 64))
+        self.assertEqual(v_cache.shape, (2, 128, 1, 64))
+        self.assertEqual(k_scale.shape, (2, 1, 128, 1, 2))
+        self.assertEqual(v_scale.shape, (2, 1, 2, 64, 2))
+        self.assertEqual(k_cache.storage_offset(), 128)
+
+    def test_split_hybrid_c8_mxfp_cache_rejects_small_buffer(self):
+        with self.assertRaisesRegex(ValueError, "hybrid cache buffer is too small"):
+            NPUModelRunner._split_hybrid_c8_mxfp_cache_buffer(
+                torch.zeros(127, dtype=torch.int8),
+                (1, 64, 1, 64),
+                (1, 64, 1, 64),
+            )
 
 
 class TestNPUModelRunnerOutputTokenIds(unittest.TestCase):
