@@ -359,6 +359,14 @@ def get_draft_graph_params():
 _draft_graph_prefill_params: GraphParams | None = None
 
 
+def reset_graph_params() -> None:
+    """Discard graph parameters created by temporary graph profiling."""
+    global _graph_params, _draft_graph_params, _draft_graph_prefill_params
+    _graph_params = None
+    _draft_graph_params = None
+    _draft_graph_prefill_params = None
+
+
 def set_draft_graph_prefill_params(aclgraph_capture_sizes: list[int]):
     global _draft_graph_prefill_params
     if _draft_graph_prefill_params is not None:

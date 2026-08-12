@@ -33,6 +33,7 @@ from vllm_ascend.compilation.acl_graph import (
     GraphParams,
     get_draft_graph_params,
     get_graph_params,
+    reset_graph_params,
     set_draft_graph_params,
     set_graph_params,
     update_draft_graph_params_workspaces,
@@ -808,6 +809,18 @@ class TestSleepGraphParams(TestBase):
 
 
 class TestDraftGraphParams(TestBase):
+    def test_reset_graph_params_clears_all_profiling_state(self):
+        with (
+            patch("vllm_ascend.compilation.acl_graph._graph_params", object()),
+            patch("vllm_ascend.compilation.acl_graph._draft_graph_params", object()),
+            patch("vllm_ascend.compilation.acl_graph._draft_graph_prefill_params", object()),
+        ):
+            reset_graph_params()
+
+            self.assertIsNone(acl_graph._graph_params)
+            self.assertIsNone(acl_graph._draft_graph_params)
+            self.assertIsNone(acl_graph._draft_graph_prefill_params)
+
     def test_set_draft_graph_params(self):
         with patch("vllm_ascend.compilation.acl_graph._draft_graph_params", new=None):
             set_draft_graph_params([4])
