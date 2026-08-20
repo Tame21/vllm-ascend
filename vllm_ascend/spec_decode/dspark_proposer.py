@@ -222,10 +222,36 @@ class AscendDSparkProposer(AscendDflashProposer):
         prefill_mask: list[bool],
     ) -> bool:
         """Save raw target states; DSpark projection is deferred to decode."""
-        if target_positions.ndim != 1:
-            raise RuntimeError("DSpark decode_only currently requires one-dimensional target positions.")
-
         offsets = self._query_offsets(common_attn_metadata)
+        if target_positions.ndim != 1:
+            if target_positions.ndim == 2 and target_positions.shape[1] == 1:
+                # Some V1 paths expose positions as [num_tokens, 1].
+                target_positions = target_positions.reshape(-1)
+            elif target_positions.ndim == 2 and target_positions.shape[0] >= common_attn_metadata.num_reqs:
+                # Other V1 paths expose a padded [num_reqs, max_query_len]
+                # matrix. Remove per-request padding using query_start_loc so
+                # positions remain aligned with the flattened hidden states.
+                position_chunks = []
+                for request_index in range(common_attn_metadata.num_reqs):
+                    start, end = offsets[request_index], offsets[request_index + 1]
+                    query_length = end - start
+                    if query_length > target_positions.shape[1]:
+                        raise RuntimeError(
+                            "DSpark decode_only received a positions row shorter than the request query: "
+                            f"request_index={request_index}, query_length={query_length}, "
+                            f"positions_width={target_positions.shape[1]}"
+                        )
+                    position_chunks.append(target_positions[request_index, :query_length])
+                target_positions = torch.cat(position_chunks, dim=0)
+            elif target_positions.numel() == target_hidden_states.shape[0]:
+                target_positions = target_positions.reshape(-1)
+            else:
+                raise RuntimeError(
+                    "DSpark decode_only received positions that cannot be aligned with target hidden states: "
+                    f"positions_shape={tuple(target_positions.shape)}, "
+                    f"hidden_tokens={target_hidden_states.shape[0]}"
+                )
+
         num_computed_tokens = getattr(common_attn_metadata, "num_computed_tokens_cpu", None)
         if num_computed_tokens is None:
             num_computed_tokens = getattr(common_attn_metadata, "_num_computed_tokens_cpu", None)
