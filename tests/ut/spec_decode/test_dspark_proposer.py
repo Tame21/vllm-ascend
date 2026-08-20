@@ -28,6 +28,7 @@ import pytest
 import torch
 
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.utils import AscendCommonAttentionMetadata
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
 from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer
 from vllm_ascend.spec_decode.llm_base_proposer import AscendSpecDecodeBaseProposer
@@ -520,6 +521,200 @@ class TestDSparkInitValidation:
         assert proposer._per_group_block_tables == {}
         assert proposer._per_group_slot_mappings == {}
         assert proposer._context_slot_mapping_buffers is None
+
+
+class TestDSparkDecodeOnlyContext(_DSparkProposerTestBase):
+    @staticmethod
+    def _metadata(*, is_prefilling, query_start_loc_cpu, num_computed_tokens=None):
+        num_reqs = len(is_prefilling)
+        query_start_loc_cpu = torch.tensor(query_start_loc_cpu, dtype=torch.int32)
+        return SimpleNamespace(
+            num_reqs=num_reqs,
+            is_prefilling=torch.tensor(is_prefilling, dtype=torch.bool),
+            query_start_loc=query_start_loc_cpu.clone(),
+            query_start_loc_cpu=query_start_loc_cpu,
+            num_computed_tokens_cpu=(
+                torch.tensor(num_computed_tokens, dtype=torch.int32)
+                if num_computed_tokens is not None
+                else None
+            ),
+        )
+
+    def _make_decode_only_proposer(self, *, max_num_tokens=16, block_size=3):
+        proposer = self._make_proposer(
+            max_num_tokens=max_num_tokens,
+            num_reqs=2,
+            block_size=block_size,
+        )
+        proposer.decode_only = True
+        proposer.max_staged_tokens = max_num_tokens
+        proposer.overflow_policy = "fallback_prefill_tail"
+        return proposer
+
+    def test_prefill_stages_raw_states_and_skips_draft(self):
+        proposer = self._make_decode_only_proposer()
+        metadata = self._metadata(
+            is_prefilling=[True, True],
+            query_start_loc_cpu=[0, 2, 4],
+            num_computed_tokens=[0, 0],
+        )
+        hidden_states = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        positions = torch.arange(4, dtype=torch.int32)
+
+        skip = proposer.prepare_decode_only_context(
+            request_ids=["req-a", "req-b"],
+            target_hidden_states=hidden_states,
+            target_positions=positions,
+            common_attn_metadata=metadata,
+        )
+
+        assert skip is True
+        assert set(proposer._pending_contexts) == {"req-a", "req-b"}
+        assert torch.equal(proposer._pending_contexts["req-a"].hidden_state_chunks[0], hidden_states[:2])
+        assert torch.equal(proposer._pending_contexts["req-b"].hidden_state_chunks[0], hidden_states[2:])
+        assert proposer._pending_contexts_for_next_proposal is None
+
+    def test_first_decode_initializes_staged_context_inside_draft_forward(self):
+        proposer = self._make_decode_only_proposer()
+        prefill_metadata = self._metadata(
+            is_prefilling=[True, True],
+            query_start_loc_cpu=[0, 2, 4],
+            num_computed_tokens=[0, 0],
+        )
+        hidden_states = torch.arange(32, dtype=torch.float32).reshape(4, 8)
+        positions = torch.arange(4, dtype=torch.int32)
+        proposer.prepare_decode_only_context(
+            request_ids=["req-a", "req-b"],
+            target_hidden_states=hidden_states,
+            target_positions=positions,
+            common_attn_metadata=prefill_metadata,
+        )
+
+        combine_hidden_states = MagicMock(return_value=hidden_states)
+        precompute_and_store_context_kv = MagicMock()
+        proposer.model.combine_hidden_states = combine_hidden_states
+        proposer.model.precompute_and_store_context_kv = precompute_and_store_context_kv
+
+        decode_metadata = self._metadata(
+            is_prefilling=[False, False],
+            query_start_loc_cpu=[0, 1, 2],
+            num_computed_tokens=[2, 2],
+        )
+        skip = proposer.prepare_decode_only_context(
+            request_ids=["req-a", "req-b"],
+            target_hidden_states=torch.zeros((2, 8), dtype=torch.float32),
+            target_positions=torch.tensor([2, 2], dtype=torch.int32),
+            common_attn_metadata=decode_metadata,
+        )
+
+        assert skip is False
+        assert proposer._pending_contexts_for_next_proposal == ["req-a", "req-b"]
+
+        proposer._initialize_pending_contexts_in_forward()
+
+        combine_hidden_states.assert_called_once()
+        precompute_and_store_context_kv.assert_called_once()
+        assert precompute_and_store_context_kv.call_args.args[0].shape == (4, 8)
+        assert precompute_and_store_context_kv.call_args.args[1].shape == (4,)
+        assert precompute_and_store_context_kv.call_args.args[2][0].shape == (4,)
+        assert not proposer._pending_contexts
+        assert proposer._ready_request_ids == {"req-a", "req-b"}
+
+    def test_mixed_batch_selects_ready_decode_and_stages_prefill_rows(self):
+        proposer = self._make_decode_only_proposer()
+        proposer._ready_request_ids.add("ready")
+        metadata = self._metadata(
+            is_prefilling=[False, True],
+            query_start_loc_cpu=[0, 1, 3],
+            num_computed_tokens=[5, 0],
+        )
+        hidden_states = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+
+        skip = proposer.prepare_decode_only_context(
+            request_ids=["ready", "new-prefill"],
+            target_hidden_states=hidden_states,
+            target_positions=torch.arange(3, dtype=torch.int32),
+            common_attn_metadata=metadata,
+        )
+
+        assert skip is False
+        assert proposer.get_decode_only_active_request_indices() == [0]
+        assert set(proposer._pending_contexts) == {"new-prefill"}
+        assert torch.equal(proposer._pending_contexts["new-prefill"].hidden_state_chunks[0], hidden_states[1:])
+        assert proposer._decode_only_empty_request_ids == {"new-prefill"}
+
+    def test_staging_overflow_uses_prefill_tail_fallback(self):
+        proposer = self._make_decode_only_proposer(max_num_tokens=4)
+        proposer.max_staged_tokens = 2
+        metadata = self._metadata(
+            is_prefilling=[True, False],
+            query_start_loc_cpu=[0, 3, 3],
+            num_computed_tokens=[0, 0],
+        )
+
+        skip = proposer.prepare_decode_only_context(
+            request_ids=["too-long", "other"],
+            target_hidden_states=torch.zeros((3, 8), dtype=torch.float32),
+            target_positions=torch.arange(3, dtype=torch.int32),
+            common_attn_metadata=metadata,
+        )
+
+        assert skip is False
+        assert "too-long" in proposer._prefill_fallback_request_ids
+        assert "too-long" not in proposer._pending_contexts
+
+    def test_mixed_batch_compacts_per_request_metadata_and_slot_maps(self):
+        proposer = self._make_decode_only_proposer()
+        metadata = AscendCommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, 1, 3], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 1, 3], dtype=torch.int32),
+            seq_lens=torch.tensor([5, 7], dtype=torch.int32),
+            seq_lens_cpu=torch.tensor([5, 7], dtype=torch.int32),
+            num_computed_tokens_cpu=torch.tensor([5, 0], dtype=torch.int32),
+            num_reqs=2,
+            num_actual_tokens=3,
+            max_query_len=2,
+            max_seq_len=7,
+            block_table_tensor=torch.tensor([[10, 11], [20, 21]], dtype=torch.int32),
+            slot_mapping=torch.tensor([100, 200, 201], dtype=torch.int32),
+            is_prefilling=torch.tensor([False, True]),
+            actual_seq_lengths_q=[1, 3],
+        )
+        target_token_ids = torch.tensor([1, 2, 3], dtype=torch.int64)
+        target_positions = torch.tensor([5, 6, 7], dtype=torch.int32)
+        target_hidden_states = torch.arange(24, dtype=torch.float32).reshape(3, 8)
+        next_token_ids = torch.tensor([10, 20], dtype=torch.int64)
+        token_indices_to_sample = torch.tensor([0, 2], dtype=torch.int32)
+        num_rejected_tokens = torch.tensor([0, 1], dtype=torch.int32)
+
+        compact = proposer.compact_decode_only_inputs(
+            request_ids=["ready", "prefill"],
+            request_indices=[1],
+            target_token_ids=target_token_ids,
+            target_positions=target_positions,
+            target_hidden_states=target_hidden_states,
+            next_token_ids=next_token_ids,
+            token_indices_to_sample=token_indices_to_sample,
+            common_attn_metadata=metadata,
+            num_rejected_tokens_gpu=num_rejected_tokens,
+        )
+
+        assert compact[5].num_reqs == 1
+        assert compact[5].query_start_loc_cpu.tolist() == [0, 2]
+        assert torch.equal(compact[0], target_token_ids[1:])
+        assert torch.equal(compact[3], next_token_ids[1:])
+        assert torch.equal(compact[6], num_rejected_tokens[1:])
+        assert torch.equal(proposer._decode_only_compact_block_tables[0], torch.tensor([[20, 21]]))
+        assert torch.equal(proposer._decode_only_compact_slot_mappings[0], torch.tensor([200, 201]))
+
+        scattered = proposer.scatter_decode_only_draft_token_ids(
+            torch.tensor([[30, 31]], dtype=torch.int64),
+            request_indices=[1],
+            request_ids=["ready", "prefill"],
+            num_reqs=2,
+        )
+        assert torch.equal(scattered, torch.tensor([[0, 0], [30, 31]], dtype=torch.int64))
+        assert proposer._decode_only_compact_block_tables is None
 
 
 class TestSetInputsFirstPassOutputs(_DSparkProposerTestBase):

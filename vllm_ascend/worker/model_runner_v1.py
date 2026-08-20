@@ -1556,6 +1556,9 @@ class NPUModelRunner(GPUModelRunner):
         elif self.speculative_config.use_eagle() or self.speculative_config.uses_draft_model():
             common_attn_metadata = spec_decode_common_attn_metadata
             sampled_token_ids = valid_sampled_token_ids
+            dspark_prefill_mask = None
+            if isinstance(self.drafter, AscendDSparkProposer):
+                dspark_prefill_mask = self.drafter.get_decode_only_prefill_mask(common_attn_metadata)
 
             if self.vllm_config.speculative_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
@@ -1642,24 +1645,100 @@ class NPUModelRunner(GPUModelRunner):
             # vLLM's ``propose(num_speculative_tokens=...)``. ``_propose`` sets
             # ``self.num_speculative_tokens`` from it, so the model runner no
             # longer mutates the drafter's state here.
-            draft_token_ids = self.drafter._propose(
-                num_speculative_tokens=scheduler_output.num_spec_tokens_to_schedule,
-                target_token_ids=target_token_ids,
-                target_positions=target_positions,
-                target_hidden_states=target_hidden_states,
-                next_token_ids=next_token_ids,
-                token_indices_to_sample=token_indices_to_sample,
-                common_attn_metadata=common_attn_metadata,
-                target_model_batch_desc=target_model_batch_desc,
-                sampling_metadata=sampling_metadata,
-                req_scheduled_tokens=req_scheduled_tokens,
-                long_seq_metadata=long_seq_metadata,
-                num_prefill_reqs=num_prefill_reqs,
-                num_decode_reqs=num_decode_reqs,
-                scheduler_output=scheduler_output,
-                num_scheduled_tokens=num_scheduled_tokens,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-            )
+            skip_dspark = False
+            if isinstance(self.drafter, AscendDSparkProposer):
+                request_ids_to_clear = set(getattr(scheduler_output, "preempted_req_ids", None) or ())
+                request_ids_to_clear.update(getattr(scheduler_output, "finished_req_ids", None) or ())
+                skip_dspark = self.drafter.prepare_decode_only_context(
+                    request_ids=self.input_batch.req_ids,
+                    target_hidden_states=target_hidden_states,
+                    target_positions=target_positions,
+                    common_attn_metadata=common_attn_metadata,
+                    preempted_request_ids=request_ids_to_clear,
+                    prefill_mask=dspark_prefill_mask,
+                )
+
+            if skip_dspark:
+                # A decode-only DSpark proposer emits no draft tokens when
+                # this batch has no eligible decode rows. Returning a
+                # zero-width tensor keeps the existing draft-token plumbing
+                # and scheduler semantics intact while allowing target-only
+                # requests to return their sampled token immediately.
+                draft_token_ids = torch.empty(
+                    (common_attn_metadata.num_reqs, 0),
+                    dtype=torch.int64,
+                    device=target_token_ids.device,
+                )
+            else:
+                propose_kwargs = dict(
+                    num_speculative_tokens=scheduler_output.num_spec_tokens_to_schedule,
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    target_hidden_states=target_hidden_states,
+                    next_token_ids=next_token_ids,
+                    token_indices_to_sample=token_indices_to_sample,
+                    common_attn_metadata=common_attn_metadata,
+                    target_model_batch_desc=target_model_batch_desc,
+                    sampling_metadata=sampling_metadata,
+                    req_scheduled_tokens=req_scheduled_tokens,
+                    long_seq_metadata=long_seq_metadata,
+                    num_prefill_reqs=num_prefill_reqs,
+                    num_decode_reqs=num_decode_reqs,
+                    scheduler_output=scheduler_output,
+                    num_scheduled_tokens=num_scheduled_tokens,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                )
+                compact_request_indices = None
+                should_compact = False
+                if isinstance(self.drafter, AscendDSparkProposer):
+                    compact_request_indices = self.drafter.get_decode_only_active_request_indices()
+                    should_compact = (
+                        compact_request_indices is not None
+                        and len(compact_request_indices) != common_attn_metadata.num_reqs
+                    )
+                    if should_compact:
+                        (
+                            compact_target_token_ids,
+                            compact_target_positions,
+                            compact_target_hidden_states,
+                            compact_next_token_ids,
+                            compact_token_indices_to_sample,
+                            compact_common_attn_metadata,
+                            compact_num_rejected_tokens_gpu,
+                            compact_req_scheduled_tokens,
+                        ) = self.drafter.compact_decode_only_inputs(
+                            request_ids=self.input_batch.req_ids,
+                            request_indices=compact_request_indices,
+                            target_token_ids=target_token_ids,
+                            target_positions=target_positions,
+                            target_hidden_states=target_hidden_states,
+                            next_token_ids=next_token_ids,
+                            token_indices_to_sample=token_indices_to_sample,
+                            common_attn_metadata=common_attn_metadata,
+                            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                            req_scheduled_tokens=req_scheduled_tokens,
+                        )
+                        propose_kwargs.update(
+                            target_token_ids=compact_target_token_ids,
+                            target_positions=compact_target_positions,
+                            target_hidden_states=compact_target_hidden_states,
+                            next_token_ids=compact_next_token_ids,
+                            token_indices_to_sample=compact_token_indices_to_sample,
+                            common_attn_metadata=compact_common_attn_metadata,
+                            num_rejected_tokens_gpu=compact_num_rejected_tokens_gpu,
+                            req_scheduled_tokens=compact_req_scheduled_tokens,
+                            num_prefill_reqs=0,
+                            num_decode_reqs=len(compact_request_indices),
+                            num_scheduled_tokens=compact_common_attn_metadata.num_actual_tokens,
+                        )
+                draft_token_ids = self.drafter._propose(**propose_kwargs)
+                if should_compact:
+                    draft_token_ids = self.drafter.scatter_decode_only_draft_token_ids(
+                        draft_token_ids=draft_token_ids,
+                        request_indices=compact_request_indices,
+                        request_ids=self.input_batch.req_ids,
+                        num_reqs=common_attn_metadata.num_reqs,
+                    )
             if get_pp_group().world_size > 1 and hasattr(
                 self.drafter, "take_last_draft_probs"
             ):
@@ -1756,20 +1835,27 @@ class NPUModelRunner(GPUModelRunner):
         if out is None:
             return None
         dynamic_spec = getattr(self.drafter, "dynamic_spec", None)
-        if dynamic_spec is None:
+        decode_only_num_verify_tokens = getattr(self.drafter, "_decode_only_num_verify_tokens", None)
+        if decode_only_num_verify_tokens is not None:
+            per_req_k = decode_only_num_verify_tokens
+        elif dynamic_spec is None:
+            per_req_k = None
+        else:
+            per_req_k = dynamic_spec.num_verify_tokens
+        empty_request_ids = getattr(self.drafter, "_decode_only_empty_request_ids", set())
+        if per_req_k is None and not empty_request_ids:
             return out
-        per_req_k = dynamic_spec.num_verify_tokens
         if per_req_k is None:
-            return out
-        per_req_k = [
-            max(0, min(int(k), self.num_spec_tokens))
-            for k in per_req_k
-        ]
+            per_req_k = [self.num_spec_tokens] * len(out.req_ids)
+        else:
+            if torch.is_tensor(per_req_k):
+                per_req_k = per_req_k.cpu().tolist()
+            per_req_k = [max(0, min(int(k), self.num_spec_tokens)) for k in per_req_k]
         cut_tokens = DraftTokenIds(
             req_ids=out.req_ids,
             draft_token_ids=[
-                tokens[:k]
-                for tokens, k in zip(out.draft_token_ids, per_req_k)
+                [] if request_id in empty_request_ids else tokens[:k]
+                for request_id, tokens, k in zip(out.req_ids, out.draft_token_ids, per_req_k)
             ],
         )
         return cut_tokens
@@ -2344,6 +2430,12 @@ class NPUModelRunner(GPUModelRunner):
                     num_reqs = draft_token_ids.shape[0]
                     draft_ids_list = draft_token_ids[:num_reqs].cpu().tolist()
                     draft_req_ids = self._draft_token_req_ids
+                    empty_request_ids = getattr(self.drafter, "_decode_only_empty_request_ids", set())
+                    if draft_req_ids and empty_request_ids:
+                        draft_ids_list = [
+                            [] if request_id in empty_request_ids else draft_ids
+                            for request_id, draft_ids in zip(draft_req_ids, draft_ids_list)
+                        ]
                 else:
                     draft_ids_list = draft_token_ids
                     draft_req_ids = self.input_batch.req_ids

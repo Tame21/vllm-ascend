@@ -24,6 +24,7 @@ from vllm.config import KVTransferConfig, VllmConfig
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import (
     AscendConfig,
+    DSparkConfig,
     DyntraLBConfig,
     EplbConfig,
     RlConfig,
@@ -1083,3 +1084,26 @@ class TestSchedulerConfig(TestBase):
 
         self.assertTrue(config.enable_balance_scheduling)
         mock_info_once.assert_called_once()
+
+
+class TestDSparkConfig(TestBase):
+    def test_default_preserves_prefill_tail_execution(self):
+        config = DSparkConfig()
+
+        self.assertEqual(config.execution_phase, "prefill_tail")
+
+    def test_decode_only_defaults(self):
+        config = DSparkConfig({"execution_phase": "decode_only"})
+
+        self.assertEqual(config.execution_phase, "decode_only")
+        self.assertEqual(config.context_staging, "gpu")
+        self.assertEqual(config.max_staged_tokens, 32768)
+        self.assertEqual(config.overflow_policy, "fallback_prefill_tail")
+
+    def test_rejects_invalid_execution_phase(self):
+        with self.assertRaisesRegex(ValueError, "execution_phase"):
+            DSparkConfig({"execution_phase": "prefill_only"})
+
+    def test_rejects_invalid_staging_limit(self):
+        with self.assertRaisesRegex(ValueError, "max_staged_tokens"):
+            DSparkConfig({"max_staged_tokens": 0})

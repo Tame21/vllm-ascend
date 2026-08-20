@@ -57,6 +57,9 @@ class AscendConfig:
         dynamic_spec_config = additional_config.get("dynamic_spec_config", {})
         self.dynamic_spec_config = DynamicSpecConfig(dynamic_spec_config)
 
+        dspark_config = additional_config.get("dspark_config", {})
+        self.dspark_config = DSparkConfig(dspark_config)
+
         eplb_config = additional_config.get("eplb_config", {})
         self.eplb_config = EplbConfig(eplb_config)
 
@@ -640,6 +643,52 @@ class DynamicSpecConfig:
                 "dynamic_spec_config.method_params must be a dict, "
                 f"got {type(self.method_params).__name__}: "
                 f"{self.method_params}"
+            )
+
+
+class DSparkConfig:
+    """Configuration for the DSpark execution phase and context staging."""
+
+    SUPPORTED_EXECUTION_PHASES = ("prefill_tail", "decode_only")
+    SUPPORTED_CONTEXT_STAGING = ("gpu",)
+    SUPPORTED_OVERFLOW_POLICIES = ("fallback_prefill_tail", "reject")
+
+    def __init__(self, config: dict | None = None):
+        if config is None:
+            config = {}
+        if not isinstance(config, dict):
+            raise TypeError(f"dspark_config must be a dict, got {type(config).__name__}: {config}")
+
+        self.execution_phase = config.get("execution_phase", "prefill_tail")
+        self.context_staging = config.get("context_staging", "gpu")
+        self.max_staged_tokens = config.get("max_staged_tokens", 32768)
+        self.overflow_policy = config.get("overflow_policy", "fallback_prefill_tail")
+        self._validate()
+
+    def _validate(self) -> None:
+        if self.execution_phase not in self.SUPPORTED_EXECUTION_PHASES:
+            raise ValueError(
+                "dspark_config.execution_phase must be one of "
+                f"{self.SUPPORTED_EXECUTION_PHASES}, got {self.execution_phase!r}"
+            )
+        if self.context_staging not in self.SUPPORTED_CONTEXT_STAGING:
+            raise ValueError(
+                "dspark_config.context_staging must be one of "
+                f"{self.SUPPORTED_CONTEXT_STAGING}, got {self.context_staging!r}"
+            )
+        if (
+            not isinstance(self.max_staged_tokens, int)
+            or isinstance(self.max_staged_tokens, bool)
+            or self.max_staged_tokens <= 0
+        ):
+            raise ValueError(
+                "dspark_config.max_staged_tokens must be a positive integer, "
+                f"got {self.max_staged_tokens!r}"
+            )
+        if self.overflow_policy not in self.SUPPORTED_OVERFLOW_POLICIES:
+            raise ValueError(
+                "dspark_config.overflow_policy must be one of "
+                f"{self.SUPPORTED_OVERFLOW_POLICIES}, got {self.overflow_policy!r}"
             )
 
 
