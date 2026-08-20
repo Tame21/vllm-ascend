@@ -186,6 +186,7 @@ def test_copy_and_expand_dflash_dspark(batch_size, ctx_lens, num_spec, sample_fr
         out_token_indices_ptr=out_token_indices,
         block_table_ptr=block_table,
         block_table_stride=max_blocks,
+        num_kv_cache_blocks=10000,
         query_start_loc_ptr=query_start_loc,
         seq_lens_ptr=seq_lens,
         num_rejected_tokens_ptr=(num_rejected_tokens if num_rejected_tokens is not None else 0),
@@ -210,3 +211,55 @@ def test_copy_and_expand_dflash_dspark(batch_size, ctx_lens, num_spec, sample_fr
     gc.collect()
     torch.npu.empty_cache()
     torch.npu.reset_peak_memory_stats()
+
+
+@pytest.mark.parametrize(
+    "seq_len,block_id,num_kv_cache_blocks",
+    [
+        (KV_BLOCK_SIZE, 1, 4),  # Required block-table column is missing.
+        (0, 4, 4),  # Physical block ID equals the exclusive upper bound.
+    ],
+)
+def test_copy_and_expand_masks_invalid_query_slots(seq_len, block_id, num_kv_cache_blocks):
+    init_device_properties_triton()
+    device = "npu"
+    num_spec = 3
+    query_start_loc = torch.tensor([0, 1], dtype=torch.int32, device=device)
+    target_positions = torch.tensor(
+        [max(seq_len - 1, 0)], dtype=torch.int32, device=device
+    )
+    context_slot_mapping = torch.zeros(1, dtype=torch.int32, device=device)
+    block_table = torch.tensor([[block_id]], dtype=torch.int32, device=device)
+    out_query_slot_mapping = torch.empty(num_spec, dtype=torch.int32, device=device)
+
+    copy_and_expand_dflash_and_dspark_inputs_kernel[(1,)](
+        next_token_ids_ptr=torch.ones(1, dtype=torch.int32, device=device),
+        target_positions_ptr=target_positions,
+        context_slot_mapping_ptr=context_slot_mapping,
+        out_input_ids_ptr=torch.empty(num_spec, dtype=torch.int32, device=device),
+        out_context_positions_ptr=torch.empty(1, dtype=torch.int32, device=device),
+        out_query_positions_ptr=torch.empty(num_spec, dtype=torch.int32, device=device),
+        out_context_slot_mapping_ptr=torch.empty(1, dtype=torch.int32, device=device),
+        out_query_slot_mapping_ptr=out_query_slot_mapping,
+        out_token_indices_ptr=torch.empty(num_spec, dtype=torch.int32, device=device),
+        block_table_ptr=block_table,
+        block_table_stride=block_table.stride(0),
+        num_kv_cache_blocks=num_kv_cache_blocks,
+        query_start_loc_ptr=query_start_loc,
+        seq_lens_ptr=torch.tensor([seq_len], dtype=torch.int32, device=device),
+        num_rejected_tokens_ptr=0,
+        parallel_drafting_token_id=PARALLEL_DRAFTING_TOKEN_ID,
+        block_size=KV_BLOCK_SIZE,
+        num_query_per_req=num_spec,
+        num_speculative_tokens=num_spec,
+        total_input_tokens=1,
+        batch_size=1,
+        HAS_NUM_REJECTED=False,
+        SAMPLE_FROM_ANCHOR=True,
+        TILE_SIZE=_COPY_EXPAND_TILE_SIZE,
+    )
+
+    torch.testing.assert_close(
+        out_query_slot_mapping,
+        torch.full_like(out_query_slot_mapping, -1),
+    )

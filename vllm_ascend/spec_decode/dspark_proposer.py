@@ -223,34 +223,11 @@ class AscendDSparkProposer(AscendDflashProposer):
     ) -> bool:
         """Save raw target states; DSpark projection is deferred to decode."""
         offsets = self._query_offsets(common_attn_metadata)
-        if target_positions.ndim != 1:
-            if target_positions.ndim == 2 and target_positions.shape[1] == 1:
-                # Some V1 paths expose positions as [num_tokens, 1].
-                target_positions = target_positions.reshape(-1)
-            elif target_positions.ndim == 2 and target_positions.shape[0] >= common_attn_metadata.num_reqs:
-                # Other V1 paths expose a padded [num_reqs, max_query_len]
-                # matrix. Remove per-request padding using query_start_loc so
-                # positions remain aligned with the flattened hidden states.
-                position_chunks = []
-                for request_index in range(common_attn_metadata.num_reqs):
-                    start, end = offsets[request_index], offsets[request_index + 1]
-                    query_length = end - start
-                    if query_length > target_positions.shape[1]:
-                        raise RuntimeError(
-                            "DSpark decode_only received a positions row shorter than the request query: "
-                            f"request_index={request_index}, query_length={query_length}, "
-                            f"positions_width={target_positions.shape[1]}"
-                        )
-                    position_chunks.append(target_positions[request_index, :query_length])
-                target_positions = torch.cat(position_chunks, dim=0)
-            elif target_positions.numel() == target_hidden_states.shape[0]:
-                target_positions = target_positions.reshape(-1)
-            else:
-                raise RuntimeError(
-                    "DSpark decode_only received positions that cannot be aligned with target hidden states: "
-                    f"positions_shape={tuple(target_positions.shape)}, "
-                    f"hidden_tokens={target_hidden_states.shape[0]}"
-                )
+        position_token_count = (
+            target_positions.shape[0]
+            if target_positions.ndim == 1
+            else target_positions.shape[-1]
+        )
 
         num_computed_tokens = getattr(common_attn_metadata, "num_computed_tokens_cpu", None)
         if num_computed_tokens is None:
@@ -293,11 +270,11 @@ class AscendDSparkProposer(AscendDflashProposer):
                 )
 
             start, end = offsets[request_index], offsets[request_index + 1]
-            if end < start or end > target_hidden_states.shape[0] or end > target_positions.shape[0]:
+            if end < start or end > target_hidden_states.shape[0] or end > position_token_count:
                 raise RuntimeError(
                     "DSpark decode_only received inconsistent prefill metadata: "
                     f"request_id={request_id!r}, start={start}, end={end}, "
-                    f"hidden_tokens={target_hidden_states.shape[0]}, position_tokens={target_positions.shape[0]}"
+                    f"hidden_tokens={target_hidden_states.shape[0]}, position_tokens={position_token_count}"
                 )
             chunk_tokens = end - start
             if chunk_tokens == 0:
@@ -330,7 +307,12 @@ class AscendDSparkProposer(AscendDflashProposer):
                 self._pending_contexts[request_id] = context
 
             context.hidden_state_chunks.append(target_hidden_states[start:end].detach().clone())
-            context.position_chunks.append(target_positions[start:end].detach().clone())
+            position_chunk = (
+                target_positions[start:end]
+                if target_positions.ndim == 1
+                else target_positions[..., start:end]
+            )
+            context.position_chunks.append(position_chunk.detach().clone())
             for gid, slot_mapping in self._per_group_slot_mappings.items():
                 if end > slot_mapping.shape[0]:
                     raise RuntimeError(
@@ -608,9 +590,11 @@ class AscendDSparkProposer(AscendDflashProposer):
             raw_hidden_states = torch.cat(
                 [chunk for context in contexts for chunk in context.hidden_state_chunks], dim=0
             )
-            context_positions = torch.cat(
-                [chunk for context in contexts for chunk in context.position_chunks], dim=0
+            position_chunks = [chunk for context in contexts for chunk in context.position_chunks]
+            position_token_axis = (
+                0 if position_chunks[0].ndim == 1 else position_chunks[0].ndim - 1
             )
+            context_positions = torch.cat(position_chunks, dim=position_token_axis)
             combined_hidden_states = self.model.combine_hidden_states(raw_hidden_states)
 
             unique_group_ids = list(dict.fromkeys(self._layer_group_idx))
@@ -764,6 +748,9 @@ class AscendDSparkProposer(AscendDflashProposer):
         return confidence_logits
 
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
+        self.num_kv_cache_blocks = int(
+            getattr(kv_cache_config, "num_blocks", torch.iinfo(torch.int32).max)
+        )
         # Find draft layers (attention layers added by draft model)
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config,
@@ -917,6 +904,7 @@ class AscendDSparkProposer(AscendDflashProposer):
                 # Block table
                 block_table_ptr=gid_block_table,
                 block_table_stride=gid_block_table.stride(0),
+                num_kv_cache_blocks=self.num_kv_cache_blocks,
                 # Metadata
                 query_start_loc_ptr=cad.query_start_loc,
                 seq_lens_ptr=cad.seq_lens,

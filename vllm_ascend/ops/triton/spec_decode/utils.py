@@ -81,6 +81,7 @@ def copy_and_expand_dflash_and_dspark_inputs_kernel(
     # Block table
     block_table_ptr,  # [max_reqs, max_blocks]
     block_table_stride,  # stride of block_table dim 0 (in elements)
+    num_kv_cache_blocks,  # number of physical KV-cache blocks
     # Metadata
     query_start_loc_ptr,  # [num_reqs + 1]
     seq_lens_ptr,  # [num_reqs]
@@ -156,10 +157,18 @@ def copy_and_expand_dflash_and_dspark_inputs_kernel(
         # identical, so this only changes behaviour for multimodal inputs.
         query_kv_slot_pos = effective_seq_len + q_idx
         block_num_q = query_kv_slot_pos // block_size
-        block_id_q = tl.load(block_table_ptr + req_idx * block_table_stride + block_num_q, mask=mask, other=0).to(
-            tl.int64
+        valid_block_num = mask & (block_num_q >= 0) & (block_num_q < block_table_stride)
+        block_id_q = tl.load(
+            block_table_ptr + req_idx * block_table_stride + block_num_q,
+            mask=valid_block_num,
+            other=-1,
+        ).to(tl.int64)
+        valid_block_id = valid_block_num & (block_id_q >= 0) & (block_id_q < num_kv_cache_blocks)
+        slot_q = tl.where(
+            valid_block_id,
+            block_id_q * block_size + (query_kv_slot_pos % block_size),
+            -1,
         )
-        slot_q = block_id_q * block_size + (query_kv_slot_pos % block_size)
         tl.store(out_query_slot_mapping_ptr + offs, slot_q, mask=mask)
 
         bonus = tl.load(next_token_ids_ptr + req_idx, mask=mask, other=0)

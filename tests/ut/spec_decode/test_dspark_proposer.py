@@ -108,6 +108,7 @@ class _DSparkProposerTestBase:
         proposer.positions[:num_query_total] = torch.arange(num_query_total, dtype=torch.int32)
         proposer.parallel_drafting_token_id = 0
         proposer.kv_cache_gid = 0
+        proposer.num_kv_cache_blocks = 1024
         proposer._dflash_num_context = 0
 
         proposer.input_ids = torch.zeros(max_num_tokens, dtype=torch.int64, device=device)
@@ -559,7 +560,7 @@ class TestDSparkDecodeOnlyContext(_DSparkProposerTestBase):
             num_computed_tokens=[0, 0],
         )
         hidden_states = torch.arange(32, dtype=torch.float32).reshape(4, 8)
-        positions = torch.arange(4, dtype=torch.int32)
+        positions = torch.arange(8, dtype=torch.int32).reshape(2, 4)
 
         skip = proposer.prepare_decode_only_context(
             request_ids=["req-a", "req-b"],
@@ -572,6 +573,8 @@ class TestDSparkDecodeOnlyContext(_DSparkProposerTestBase):
         assert set(proposer._pending_contexts) == {"req-a", "req-b"}
         assert torch.equal(proposer._pending_contexts["req-a"].hidden_state_chunks[0], hidden_states[:2])
         assert torch.equal(proposer._pending_contexts["req-b"].hidden_state_chunks[0], hidden_states[2:])
+        assert torch.equal(proposer._pending_contexts["req-a"].position_chunks[0], positions[..., :2])
+        assert torch.equal(proposer._pending_contexts["req-b"].position_chunks[0], positions[..., 2:])
         assert proposer._pending_contexts_for_next_proposal is None
 
     def test_first_decode_initializes_staged_context_inside_draft_forward(self):
@@ -582,7 +585,7 @@ class TestDSparkDecodeOnlyContext(_DSparkProposerTestBase):
             num_computed_tokens=[0, 0],
         )
         hidden_states = torch.arange(32, dtype=torch.float32).reshape(4, 8)
-        positions = torch.arange(4, dtype=torch.int32)
+        positions = torch.arange(8, dtype=torch.int32).reshape(2, 4)
         proposer.prepare_decode_only_context(
             request_ids=["req-a", "req-b"],
             target_hidden_states=hidden_states,
@@ -615,7 +618,7 @@ class TestDSparkDecodeOnlyContext(_DSparkProposerTestBase):
         combine_hidden_states.assert_called_once()
         precompute_and_store_context_kv.assert_called_once()
         assert precompute_and_store_context_kv.call_args.args[0].shape == (4, 8)
-        assert precompute_and_store_context_kv.call_args.args[1].shape == (4,)
+        assert torch.equal(precompute_and_store_context_kv.call_args.args[1], positions)
         assert precompute_and_store_context_kv.call_args.args[2][0].shape == (4,)
         assert not proposer._pending_contexts
         assert proposer._ready_request_ids == {"req-a", "req-b"}
@@ -876,6 +879,7 @@ class TestSetInputsFirstPassRejectedTokens(_DSparkProposerTestBase):
         assert kwargs["HAS_NUM_REJECTED"] is True
         assert kwargs["num_rejected_tokens_ptr"] is rejected
         assert kwargs["SAMPLE_FROM_ANCHOR"] is True
+        assert kwargs["num_kv_cache_blocks"] == proposer.num_kv_cache_blocks
 
 
 class TestInitializeAttnBackendErrors(_DSparkProposerTestBase):

@@ -84,6 +84,11 @@ class AscendDflashProposer(AscendEagleProposer):
         )
 
         self.parallel_drafting_hidden_state_tensor = None
+        # DFlash does not own KV-cache initialization, so retain its existing
+        # block-id behavior while still benefiting from block-table column
+        # bounds checks in the shared expansion kernel. DSpark replaces this
+        # with the configured physical block count during backend setup.
+        self.num_kv_cache_blocks = torch.iinfo(torch.int32).max
 
         dynamic_spec_config = get_ascend_config().dynamic_spec_config
         self.dynamic_spec = None
@@ -144,6 +149,7 @@ class AscendDflashProposer(AscendEagleProposer):
             # Block table
             block_table_ptr=cad.block_table_tensor,
             block_table_stride=cad.block_table_tensor.stride(0),
+            num_kv_cache_blocks=self.num_kv_cache_blocks,
             # Metadata
             query_start_loc_ptr=cad.query_start_loc,
             seq_lens_ptr=cad.seq_lens,
