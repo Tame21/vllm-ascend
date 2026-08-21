@@ -26,6 +26,7 @@ from vllm.config import VllmConfig, get_layers_from_vllm_config
 from vllm.config.compilation import CUDAGraphMode
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backend import AttentionBackend
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.block_table import BlockTables
 from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
@@ -46,6 +47,23 @@ from vllm_ascend.worker.v2.attn_utils import (
 from vllm_ascend.worker.v2.input_batch import AscendInputBuffers
 
 logger = logging.getLogger(__name__)
+
+
+def _iter_full_attn_metadata(attn_metadata: dict[str, Any]):
+    """Yield full-attention (GQA/MLA/...) metadata, skipping SSM layers.
+
+    Hybrid models run GDN (linear attention) layers alongside full-attention
+    layers, and the metadata dict passed to the speculator can mix both
+    (e.g. draft prefill reuses the target model's metadata). GDN metadata
+    carries no ``seq_lens``/``seq_lens_cpu``/``attn_state``: its recurrent
+    state advances inside the GDN kernels, driven by the query layout and
+    cache indices computed at build time (mirroring v1, where the drafter
+    never touches GDN metadata). The speculator's per-step seq-len
+    bookkeeping therefore only applies to full-attention metadata.
+    """
+    for attn_meta in attn_metadata.values():
+        if attn_meta is not None and not isinstance(attn_meta, GDNAttentionMetadata):
+            yield attn_meta
 
 
 class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
@@ -337,9 +355,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
             )
         if attn_metadata is not None:
             # Ascend-specific: force DecodeOnly attention state for the draft model.
-            for metadata in attn_metadata.values():
-                if metadata is None:
-                    continue
+            for metadata in _iter_full_attn_metadata(attn_metadata):
                 metadata.attn_state = AscendAttentionState.DecodeOnly
         return attn_metadata
 
@@ -366,7 +382,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         if self.attn_architecture in ("DSA", "SFA"):
             return
         if attn_metadata is not None:
-            for attn_meta in attn_metadata.values():
+            for attn_meta in _iter_full_attn_metadata(attn_metadata):
                 attn_meta.seq_lens = attn_meta.seq_lens + 1
                 attn_meta.seq_len_list = attn_meta.seq_lens.tolist()
 
@@ -404,7 +420,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
             per_step_attn_metadata = {k: copy(v) for k, v in attn_metadata.items()}
 
             seq_lens_cpu = seq_lens_cpu[:num_reqs_padded]
-            for metadata in per_step_attn_metadata.values():
+            for metadata in _iter_full_attn_metadata(per_step_attn_metadata):
                 metadata.attn_state = attn_state
                 metadata.seq_lens_cpu = seq_lens_cpu
                 if self.attn_architecture == "MLA":
@@ -424,7 +440,9 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
         if self.attn_architecture in ("DSA", "SFA"):
             return
 
-        attn_meta = next(iter(attn_metadata.values()))
+        attn_meta = next(_iter_full_attn_metadata(attn_metadata), None)
+        if attn_meta is None:
+            return
         num_reqs_padded = attn_meta.seq_lens_cpu.shape[0]
         seq_lens_cpu = self._get_seq_lens_cpu()[:num_reqs_padded]
         if num_reqs is None:
@@ -433,7 +451,7 @@ class AscendAutoRegressiveSpeculator(AutoRegressiveSpeculator):
 
         query_lens_list = [i for i in range(1, num_reqs_padded + 1)]
         seq_lens_list = next_seq_lens_cpu.tolist()
-        for metadata in attn_metadata.values():
+        for metadata in _iter_full_attn_metadata(attn_metadata):
             if self.attn_architecture == "MLA":
                 decode_metadata = metadata.decode
             else:
