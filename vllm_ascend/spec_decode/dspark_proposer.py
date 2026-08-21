@@ -770,9 +770,87 @@ class AscendDSparkProposer(AscendDflashProposer):
                 block_size=int(attn_group.kv_cache_spec.block_size),
                 out_slots=out_slots,
             )
+            self._debug_validate_context_slots(
+                gid=gid,
+                block_table=block_table,
+                block_size=int(attn_group.kv_cache_spec.block_size),
+                positions=positions,
+                req_row_map_cpu=req_row_map_cpu,
+                out_slots=out_slots,
+            )
             per_group_slots[gid] = out_slots
         slots_by_layer = [per_group_slots[gidx] for gidx in self._layer_group_idx]
         self.model.precompute_and_store_context_kv(combined, positions, slots_by_layer)
+
+    def _debug_validate_context_slots(
+        self,
+        gid: int,
+        block_table: torch.Tensor,
+        block_size: int,
+        positions: torch.Tensor,
+        req_row_map_cpu: torch.Tensor,
+        out_slots: torch.Tensor,
+    ) -> None:
+        """Debug-only validation of rebuilt context slots (env-gated).
+
+        Enabled with VLLM_ASCEND_DSPARK_DEBUG=1. Intentionally synchronizes
+        with the device: it turns an async device-side fault (aivec 'MTE
+        accesses an invalid GM address') into an immediate Python error that
+        carries the offending values, so a bad block table / block size is
+        diagnosable from the engine log instead of a device reset.
+        """
+        import os
+
+        if os.getenv("VLLM_ASCEND_DSPARK_DEBUG", "0") != "1":
+            return
+        max_pos = int(positions.max().item())
+        min_pos = int(positions.min().item())
+        max_block_num = max_pos // block_size
+        if max_block_num >= block_table.shape[1]:
+            raise RuntimeError(
+                "[dspark/decode_only][debug] position {} needs block column {} "
+                "but group {} block table has only {} columns "
+                "(block_size={}, block_table.shape={}, rows={}).".format(
+                    max_pos,
+                    max_block_num,
+                    gid,
+                    block_table.shape[1],
+                    block_size,
+                    tuple(block_table.shape),
+                    req_row_map_cpu.tolist(),
+                )
+            )
+        rows = req_row_map_cpu.to(torch.int64)
+        needed_blocks = block_table[rows, : max_block_num + 1]
+        bad_mask = needed_blocks < 0
+        slots_min = int(out_slots.min().item())
+        slots_max = int(out_slots.max().item())
+        if bool(bad_mask.any().item()):
+            raise RuntimeError(
+                "[dspark/decode_only][debug] group {} block table contains "
+                "invalid (negative) block ids for required columns 0..{}: "
+                "{}; positions=[{}, {}], block_size={}, rows={}.".format(
+                    gid,
+                    max_block_num,
+                    needed_blocks.tolist(),
+                    min_pos,
+                    max_pos,
+                    block_size,
+                    req_row_map_cpu.tolist(),
+                )
+            )
+        logger.warning(
+            "[dspark/decode_only][debug] gid=%d block_size=%d positions=[%d, %d] "
+            "needed_blocks(row0)=%s slots=[%d, %d] (max block id=%d)",
+            gid,
+            block_size,
+            min_pos,
+            max_pos,
+            needed_blocks[0].tolist() if needed_blocks.shape[0] else [],
+            slots_min,
+            slots_max,
+            int(needed_blocks.max().item()),
+        )
 
     def _mark_rows_proposed(
         self,
