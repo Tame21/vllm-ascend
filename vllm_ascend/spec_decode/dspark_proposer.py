@@ -1,19 +1,95 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import copy
+from dataclasses import dataclass, field
+from enum import Enum, auto
 from typing import Any
 
+import numpy as np
 import torch
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.logger import logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.v1.attention.backends.utils import CommonAttentionMetadata
 from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+from vllm.v1.utils import record_function_or_nullcontext
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_ascend.ascend_config import DSparkExecutionConfig, get_ascend_config
 from vllm_ascend.ascend_forward_context import set_ascend_forward_context
 from vllm_ascend.attention.attention_v1 import AscendAttentionState
-from vllm_ascend.ops.triton.spec_decode.utils import copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid
+from vllm_ascend.ops.triton.spec_decode.utils import (
+    build_dspark_context_slots,
+    copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid,
+)
 from vllm_ascend.spec_decode.dflash_proposer import AscendDflashProposer
+
+# Allocation errors that may be raised by staging clones. Falling back is
+# allowed only because no DSpark KV write has happened yet at that point.
+_STAGING_ALLOC_ERRORS = (
+    RuntimeError,
+    getattr(torch, "OutOfMemoryError", RuntimeError),
+)
+
+
+def _tensor_bytes(tensor: torch.Tensor) -> int:
+    return tensor.numel() * tensor.element_size()
+
+
+class DSparkRequestPhase(Enum):
+    """Per-request lifecycle of the DSpark decode-only state machine."""
+
+    COLLECTING = auto()
+    PENDING_INIT = auto()
+    READY = auto()
+    FALLBACK_PREFILL = auto()
+    INVALID = auto()
+
+
+@dataclass
+class StagedDSparkChunk:
+    """One staged prefill chunk of raw target auxiliary hidden states.
+
+    The hidden states are stored *before* ``combine_hidden_states()`` so no
+    DSpark computation enters the prefill critical path. Slot mappings are
+    intentionally not retained: lazy init rebuilds them from the current
+    block tables.
+    """
+
+    raw_hidden_states: torch.Tensor
+    positions: torch.Tensor
+    num_tokens: int
+    num_bytes: int
+    hidden_row_bytes: int
+    position_row_bytes: int
+
+
+@dataclass
+class PendingDSparkContext:
+    """Decode-only staging state of a single request (keyed by request_id)."""
+
+    request_id: str
+    generation: int
+    phase: DSparkRequestPhase = DSparkRequestPhase.COLLECTING
+    chunks: list[StagedDSparkChunk] = field(default_factory=list)
+    num_staged_tokens: int = 0
+    num_staged_bytes: int = 0
+    prompt_len: int = 0
+    retained_context_tokens: int | None = None
+    fallback_reason: str | None = None
+    lazy_init_done: bool = False
+
+
+@dataclass
+class DSparkDecodeOnlyRequestMeta:
+    """Scheduler-derived per-request step classification (CPU only)."""
+
+    request_rows: list[int]
+    request_ids: list[str]
+    is_prefill: list[bool]
+    finishes_prefill: list[bool]
+    prompt_lens: list[int]
 
 
 class AscendDSparkProposer(AscendDflashProposer):
@@ -102,6 +178,780 @@ class AscendDSparkProposer(AscendDflashProposer):
         # per-layer context slot mappings as a flat list
         self._context_slot_mapping_buffers: list[torch.Tensor | None] | None = None
 
+        # ---------------- decode-only state ----------------
+        self._init_decode_only_state()
+
+    # ------------------------------------------------------------------
+    # Decode-only: configuration, request state and lifecycle
+    # ------------------------------------------------------------------
+
+    def _resolve_decode_only_exec_config(self) -> DSparkExecutionConfig | None:
+        """Resolve the decode-only exec config, never silently dropping it.
+
+        Normal path: the AscendConfig singleton (initialized by the platform
+        before any worker/drafter construction). Fallback: parse
+        ``additional_config.dspark_config`` directly so a request for
+        decode_only is honored (or fails validation loudly) even if the
+        singleton is not initialized yet.
+        """
+        try:
+            dspark_config = getattr(get_ascend_config(), "dspark_config", None)
+            if dspark_config is not None and dspark_config.decode_only:
+                return dspark_config
+            return None
+        except RuntimeError:
+            pass
+        vllm_config = getattr(self, "vllm_config", None)
+        additional_config = getattr(vllm_config, "additional_config", None)
+        if not isinstance(additional_config, dict):
+            return None
+        if not isinstance(additional_config.get("dspark_config"), dict):
+            return None
+        return DSparkExecutionConfig(additional_config["dspark_config"], vllm_config)
+
+    def _init_decode_only_state(self) -> None:
+        exec_config = self._resolve_decode_only_exec_config()
+
+        self.decode_only = exec_config is not None
+        self._dspark_exec_config = exec_config
+        # request_id -> staging context
+        self._pending_contexts: dict[str, PendingDSparkContext] = {}
+        # request_id -> generation counter (bumped on release) so an aborted
+        # and immediately resubmitted request never reuses stale state.
+        self._request_generations: dict[str, int] = {}
+        self._total_staged_bytes = 0
+        # Retained context window across all draft KV layers:
+        #   None                -> keep the full prompt (any full-attention layer)
+        #   max(sliding_window) -> keep only the last N positions
+        self._dspark_retained_context_tokens: int | None = None
+        # Per-group slot buffers used by lazy init / context-only fallback.
+        self._lazy_init_slot_buffers: dict[int, torch.Tensor] | None = None
+        # CPU-only counters/gauges; never synchronize with the device.
+        self._dspark_stats: dict[str, int] = {
+            "pending_requests": 0,
+            "staged_tokens": 0,
+            "staged_bytes": 0,
+            "fallbacks_per_request_tokens": 0,
+            "fallbacks_total_bytes": 0,
+            "fallbacks_alloc": 0,
+            "invalidated_resumed": 0,
+            "invalidated_rewind": 0,
+            "invalidated_recompute": 0,
+        }
+        # Per-step valid mask of the last decode-only proposal, aligned with
+        # the full persistent batch rows. None means "all rows valid" (or no
+        # decode-only proposal has run yet).
+        self._last_draft_valid_mask: list[bool] | None = None
+
+        if exec_config is not None:
+            logger.info(
+                "[dspark/decode_only] enabled: max_staged_tokens_per_request=%d, "
+                "max_staged_bytes_total=%d, lazy_init_chunk_tokens=%d, "
+                "overflow_policy=%s",
+                exec_config.max_staged_tokens_per_request,
+                exec_config.max_staged_bytes_total,
+                exec_config.lazy_init_chunk_tokens,
+                exec_config.overflow_policy,
+            )
+
+    def _decode_only_limits(self) -> tuple[int, int, int]:
+        cfg = self._dspark_exec_config
+        assert cfg is not None
+        return (
+            cfg.max_staged_tokens_per_request,
+            cfg.max_staged_bytes_total,
+            cfg.lazy_init_chunk_tokens,
+        )
+
+    def take_last_draft_valid_mask(self) -> list[bool] | None:
+        """Return the per-row valid mask of the last decode-only proposal."""
+        return self._last_draft_valid_mask
+
+    def release_requests(self, request_ids) -> None:
+        """Drop all decode-only state for finished/cancelled requests."""
+        for req_id in request_ids:
+            ctx = self._pending_contexts.pop(req_id, None)
+            if ctx is None:
+                continue
+            self._release_staging(ctx)
+            self._request_generations[req_id] = ctx.generation + 1
+
+    def invalidate_requests(self, request_ids, reason: str) -> None:
+        """Drop state after preemption/resume/rewind; re-collect from scratch."""
+        stats_key = f"invalidated_{reason}"
+        for req_id in set(request_ids):
+            ctx = self._pending_contexts.pop(req_id, None)
+            if ctx is None:
+                continue
+            self._release_staging(ctx)
+            self._request_generations[req_id] = ctx.generation + 1
+            self._dspark_stats[stats_key] = self._dspark_stats.get(stats_key, 0) + 1
+            logger.warning(
+                "[dspark/decode_only] invalidated request %s (generation=%d, reason=%s)",
+                req_id,
+                ctx.generation,
+                reason,
+            )
+
+    def _release_staging(self, ctx: PendingDSparkContext) -> None:
+        if ctx.chunks:
+            ctx.chunks.clear()
+        self._total_staged_bytes = max(0, self._total_staged_bytes - ctx.num_staged_bytes)
+        ctx.num_staged_tokens = 0
+        ctx.num_staged_bytes = 0
+        ctx.lazy_init_done = False
+        self._refresh_staging_stats()
+
+    def _refresh_staging_stats(self) -> None:
+        self._dspark_stats["pending_requests"] = sum(
+            1 for c in self._pending_contexts.values() if c.phase == DSparkRequestPhase.PENDING_INIT
+        )
+        self._dspark_stats["staged_tokens"] = sum(c.num_staged_tokens for c in self._pending_contexts.values())
+        self._dspark_stats["staged_bytes"] = self._total_staged_bytes
+
+    def _get_or_create_context(self, request_id: str, prompt_len: int) -> PendingDSparkContext:
+        ctx = self._pending_contexts.get(request_id)
+        if ctx is not None:
+            return ctx
+        ctx = PendingDSparkContext(
+            request_id=request_id,
+            generation=self._request_generations.get(request_id, 0),
+            prompt_len=prompt_len,
+            retained_context_tokens=self._dspark_retained_context_tokens,
+        )
+        self._pending_contexts[request_id] = ctx
+        return ctx
+
+    # ------------------------------------------------------------------
+    # Decode-only: request classification (CPU metadata only, no .item())
+    # ------------------------------------------------------------------
+
+    def classify_decode_only_requests(
+        self,
+        req_ids: list[str],
+        num_computed_tokens_cpu,
+        num_prompt_tokens,
+        num_scheduled_tokens: dict[str, int],
+    ) -> DSparkDecodeOnlyRequestMeta:
+        num_reqs = len(req_ids)
+        is_prefill: list[bool] = []
+        finishes_prefill: list[bool] = []
+        prompt_lens: list[int] = []
+        for row in range(num_reqs):
+            num_computed_before = int(num_computed_tokens_cpu[row])
+            prompt_len = int(num_prompt_tokens[row])
+            scheduled = num_scheduled_tokens.get(req_ids[row], 0)
+            row_is_prefill = num_computed_before < prompt_len
+            is_prefill.append(row_is_prefill)
+            finishes_prefill.append(row_is_prefill and num_computed_before + scheduled >= prompt_len)
+            prompt_lens.append(prompt_len)
+        return DSparkDecodeOnlyRequestMeta(
+            request_rows=list(range(num_reqs)),
+            request_ids=list(req_ids),
+            is_prefill=is_prefill,
+            finishes_prefill=finishes_prefill,
+            prompt_lens=prompt_lens,
+        )
+
+    def _collect_eligible_rows(self, meta: DSparkDecodeOnlyRequestMeta) -> tuple[list[int], list[int], list[int]]:
+        """Rows eligible for a DSpark proposal after staging, by category.
+
+        Returns (pending_first_decode_rows, ready_decode_rows,
+        fallback_final_prefill_rows).
+        """
+        pending_rows: list[int] = []
+        ready_rows: list[int] = []
+        fallback_final_rows: list[int] = []
+        for row, req_id in enumerate(meta.request_ids):
+            ctx = self._pending_contexts.get(req_id)
+            phase = ctx.phase if ctx is not None else DSparkRequestPhase.COLLECTING
+            if phase == DSparkRequestPhase.INVALID:
+                raise RuntimeError(
+                    f"[dspark/decode_only] request {req_id} is INVALID; "
+                    "refusing to continue with corrupted DSpark state."
+                )
+            if meta.is_prefill[row]:
+                if phase == DSparkRequestPhase.FALLBACK_PREFILL and meta.finishes_prefill[row]:
+                    fallback_final_rows.append(row)
+                continue
+            if phase == DSparkRequestPhase.PENDING_INIT:
+                pending_rows.append(row)
+            elif phase == DSparkRequestPhase.READY:
+                ready_rows.append(row)
+            elif phase == DSparkRequestPhase.FALLBACK_PREFILL:
+                # Decode after a fallback final prefill: the final-prefill
+                # proposal already moved it to READY; anything else means the
+                # fallback never completed its final prefill.
+                raise RuntimeError(
+                    f"[dspark/decode_only] request {req_id} is in FALLBACK_PREFILL "
+                    "at a decode step; state machine is inconsistent."
+                )
+            else:
+                raise RuntimeError(
+                    f"[dspark/decode_only] request {req_id} reached a decode step "
+                    f"in phase {phase.name} without any staged prefill context; "
+                    "DSpark decode-only requires the prefill to be observed."
+                )
+        return pending_rows, ready_rows, fallback_final_rows
+
+    # ------------------------------------------------------------------
+    # Decode-only: prefill staging (no DSpark model op is allowed here)
+    # ------------------------------------------------------------------
+
+    def stage_prefill_context(
+        self,
+        meta: DSparkDecodeOnlyRequestMeta,
+        raw_target_hidden_states: torch.Tensor,
+        target_positions: torch.Tensor,
+        query_start_loc_cpu: torch.Tensor,
+    ) -> None:
+        """Stage raw target auxiliary hidden states for every prefill row.
+
+        Must not call ``combine_hidden_states()``,
+        ``precompute_and_store_context_kv()``, the draft forward or any
+        draft head: those all belong to the lazy-init / proposal phases.
+        """
+        qsl = query_start_loc_cpu
+        for row, req_id in enumerate(meta.request_ids):
+            if not meta.is_prefill[row]:
+                continue
+            ctx = self._get_or_create_context(req_id, prompt_len=meta.prompt_lens[row])
+            ctx.prompt_len = meta.prompt_lens[row]
+            if ctx.phase in (DSparkRequestPhase.PENDING_INIT, DSparkRequestPhase.READY):
+                # Prefill re-scheduled for an already-initialized request
+                # without a resume/rewind hook: treat as recompute and
+                # re-collect from scratch.
+                previous_phase = ctx.phase
+                self._release_staging(ctx)
+                ctx.phase = DSparkRequestPhase.COLLECTING
+                ctx.fallback_reason = None
+                self._dspark_stats["invalidated_recompute"] += 1
+                logger.warning(
+                    "[dspark/decode_only] request %s re-entered prefill in phase %s; resetting to COLLECTING",
+                    req_id,
+                    previous_phase.name,
+                )
+            if ctx.phase == DSparkRequestPhase.INVALID:
+                raise RuntimeError(f"[dspark/decode_only] request {req_id} is INVALID; refusing to stage.")
+
+            start = int(qsl[row])
+            end = int(qsl[row + 1])
+            raw_slice = raw_target_hidden_states[start:end]
+            pos_slice = target_positions[start:end]
+
+            if ctx.phase == DSparkRequestPhase.FALLBACK_PREFILL:
+                # Already fell back: project this chunk directly, no staging.
+                self._project_live_chunk(ctx, row, raw_slice, pos_slice)
+                if meta.finishes_prefill[row]:
+                    pass  # eligibility handled by _collect_eligible_rows
+                continue
+
+            try:
+                hidden = raw_slice.detach().clone()
+                positions = pos_slice.detach().to(torch.int32).clone()
+            except _STAGING_ALLOC_ERRORS:
+                self._dspark_stats["fallbacks_alloc"] += 1
+                logger.warning(
+                    "[dspark/decode_only] staging allocation failed for request "
+                    "%s; falling back to prefill_tail for this request.",
+                    req_id,
+                )
+                self._fallback_prefill_tail(ctx, row, live_raw=raw_slice, live_pos=pos_slice)
+                continue
+
+            chunk = StagedDSparkChunk(
+                raw_hidden_states=hidden,
+                positions=positions,
+                num_tokens=hidden.shape[0],
+                num_bytes=_tensor_bytes(hidden) + _tensor_bytes(positions),
+                hidden_row_bytes=hidden[0].numel() * hidden.element_size() if hidden.shape[0] else 0,
+                position_row_bytes=positions[0].numel() * positions.element_size() if positions.shape[0] else 0,
+            )
+            ctx.chunks.append(chunk)
+            ctx.num_staged_tokens += chunk.num_tokens
+            ctx.num_staged_bytes += chunk.num_bytes
+            self._total_staged_bytes += chunk.num_bytes
+
+            self._trim_staged_prefix(ctx)
+            if self._staging_limits_exceeded(ctx):
+                self._fallback_prefill_tail(ctx, row, live_raw=None, live_pos=None)
+                continue
+
+            if meta.finishes_prefill[row]:
+                ctx.phase = DSparkRequestPhase.PENDING_INIT
+                self._refresh_staging_stats()
+
+    def _trim_staged_prefix(self, ctx: PendingDSparkContext) -> None:
+        """Keep only the last ``retained_context_tokens`` staged positions."""
+        keep = ctx.retained_context_tokens
+        if keep is None or ctx.num_staged_tokens <= keep:
+            return
+        dropped_rows = 0
+        dropped_bytes = 0
+        while ctx.chunks and ctx.num_staged_tokens - ctx.chunks[0].num_tokens >= keep:
+            chunk = ctx.chunks.pop(0)
+            ctx.num_staged_tokens -= chunk.num_tokens
+            ctx.num_staged_bytes -= chunk.num_bytes
+            dropped_rows += chunk.num_tokens
+            dropped_bytes += chunk.num_bytes
+        overflow = ctx.num_staged_tokens - keep
+        if overflow > 0 and ctx.chunks:
+            head = ctx.chunks[0]
+            # Slice at token granularity; the narrow view keeps the original
+            # storage but accounting uses the retained rows only.
+            ctx.chunks[0] = StagedDSparkChunk(
+                raw_hidden_states=head.raw_hidden_states[overflow:],
+                positions=head.positions[overflow:],
+                num_tokens=head.num_tokens - overflow,
+                num_bytes=head.num_bytes - overflow * (head.hidden_row_bytes + head.position_row_bytes),
+                hidden_row_bytes=head.hidden_row_bytes,
+                position_row_bytes=head.position_row_bytes,
+            )
+            ctx.num_staged_tokens -= overflow
+            head_row_bytes = head.hidden_row_bytes + head.position_row_bytes
+            ctx.num_staged_bytes -= overflow * head_row_bytes
+            dropped_rows += overflow
+            dropped_bytes += overflow * head_row_bytes
+        self._total_staged_bytes = max(0, self._total_staged_bytes - dropped_bytes)
+
+    def _staging_limits_exceeded(self, ctx: PendingDSparkContext) -> bool:
+        max_tokens, max_bytes_total, _ = self._decode_only_limits()
+        if ctx.num_staged_tokens > max_tokens:
+            ctx.fallback_reason = "per_request_tokens"
+            self._dspark_stats["fallbacks_per_request_tokens"] += 1
+            return True
+        if self._total_staged_bytes > max_bytes_total:
+            ctx.fallback_reason = "total_bytes"
+            self._dspark_stats["fallbacks_total_bytes"] += 1
+            return True
+        return False
+
+    def _fallback_prefill_tail(
+        self,
+        ctx: PendingDSparkContext,
+        request_row: int,
+        live_raw: torch.Tensor | None,
+        live_pos: torch.Tensor | None,
+    ) -> None:
+        """Per-request overflow fallback: move DSpark context work back to prefill.
+
+        Projects everything staged so far (plus the chunk that triggered the
+        overflow) into the DSpark KV cache, releases staging and switches the
+        request to ``FALLBACK_PREFILL`` so later chunks write incrementally.
+        """
+        with record_function_or_nullcontext("dspark_context_only_fallback"):
+            if live_raw is not None and live_pos is not None:
+                hidden = live_raw.detach().clone()
+                positions = live_pos.detach().to(torch.int32).clone()
+                ctx.chunks.append(
+                    StagedDSparkChunk(
+                        raw_hidden_states=hidden,
+                        positions=positions,
+                        num_tokens=hidden.shape[0],
+                        num_bytes=_tensor_bytes(hidden) + _tensor_bytes(positions),
+                        hidden_row_bytes=(hidden[0].numel() * hidden.element_size() if hidden.shape[0] else 0),
+                        position_row_bytes=(
+                            positions[0].numel() * positions.element_size() if positions.shape[0] else 0
+                        ),
+                    )
+                )
+                ctx.num_staged_tokens += hidden.shape[0]
+                ctx.num_staged_bytes += _tensor_bytes(hidden) + _tensor_bytes(positions)
+                self._total_staged_bytes += _tensor_bytes(hidden) + _tensor_bytes(positions)
+            reason = ctx.fallback_reason or "overflow"
+            logger.warning(
+                "[dspark/decode_only] request %s exceeds staging limits "
+                "(reason=%s, staged_tokens=%d, staged_bytes=%d); falling back "
+                "to prefill_tail for this request.",
+                ctx.request_id,
+                reason,
+                ctx.num_staged_tokens,
+                ctx.num_staged_bytes,
+            )
+            self._project_staged_contexts([ctx], [request_row])
+            self._release_staging(ctx)
+            ctx.phase = DSparkRequestPhase.FALLBACK_PREFILL
+            ctx.fallback_reason = reason
+
+    def _project_live_chunk(
+        self,
+        ctx: PendingDSparkContext,
+        request_row: int,
+        raw: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> None:
+        """Context-only projection of one live chunk for FALLBACK_PREFILL.
+
+        A prefill chunk may be larger than ``lazy_init_chunk_tokens``; split
+        it so every projection pack fits the preallocated slot buffers.
+        """
+        del ctx
+        with record_function_or_nullcontext("dspark_context_only_fallback"):
+            _, _, chunk_tokens = self._decode_only_limits()
+            num_tokens = raw.shape[0]
+            offset = 0
+            while offset < num_tokens:
+                take = min(chunk_tokens, num_tokens - offset)
+                qsl = torch.tensor([0, take], dtype=torch.int32)
+                row_map = torch.tensor([request_row], dtype=torch.int32)
+                self._project_context_kv(
+                    raw[offset : offset + take].detach().clone(),
+                    positions[offset : offset + take].detach().to(torch.int32).clone(),
+                    row_map,
+                    qsl,
+                )
+                offset += take
+
+    # ------------------------------------------------------------------
+    # Decode-only: lazy init and context slot rebuild
+    # ------------------------------------------------------------------
+
+    def initialize_pending_contexts(
+        self,
+        request_ids: list[str],
+        full_batch_rows: list[int],
+    ) -> None:
+        """Project staged prompt context into the current DSpark KV blocks.
+
+        Called after the first ordinary decode's target forward. Staged
+        prompt hidden states are combined, their context slots are rebuilt
+        from the *current* per-group block tables, and
+        ``precompute_and_store_context_kv`` writes them in
+        ``lazy_init_chunk_tokens``-sized packs.
+        """
+        contexts = [self._pending_contexts[req_id] for req_id in request_ids]
+        try:
+            self._project_staged_contexts(contexts, full_batch_rows)
+        except Exception as exc:
+            for ctx in contexts:
+                ctx.phase = DSparkRequestPhase.INVALID
+                self._release_staging(ctx)
+            raise RuntimeError(
+                "[dspark/decode_only] lazy init failed midway for requests "
+                f"{request_ids}; DSpark KV state is unrecoverable for them."
+            ) from exc
+        for ctx in contexts:
+            ctx.lazy_init_done = True
+
+    def _project_staged_contexts(
+        self,
+        contexts: list[PendingDSparkContext],
+        full_batch_rows: list[int],
+    ) -> None:
+        _, _, chunk_tokens = self._decode_only_limits()
+        # Each segment: (full_batch_row, hidden_view, position_view, num_tokens)
+        segments: list[tuple[int, torch.Tensor, torch.Tensor, int]] = []
+        pending_tokens = 0
+
+        def flush() -> None:
+            nonlocal segments, pending_tokens
+            if not segments:
+                return
+            raw = torch.cat([seg[1] for seg in segments], dim=0)
+            pos = torch.cat([seg[2] for seg in segments], dim=0)
+            qsl_values = [0]
+            row_values: list[int] = []
+            for seg_row, _, _, seg_tokens in segments:
+                row_values.append(seg_row)
+                qsl_values.append(qsl_values[-1] + seg_tokens)
+            row_map = torch.tensor(row_values, dtype=torch.int32)
+            qsl = torch.tensor(qsl_values, dtype=torch.int32)
+            self._project_context_kv(raw, pos, row_map, qsl)
+            segments = []
+            pending_tokens = 0
+
+        for ctx, row in zip(contexts, full_batch_rows):
+            for chunk in ctx.chunks:
+                offset = 0
+                remaining = chunk.num_tokens
+                while remaining > 0:
+                    if pending_tokens >= chunk_tokens:
+                        flush()
+                    take = min(remaining, chunk_tokens - pending_tokens)
+                    segments.append(
+                        (
+                            row,
+                            chunk.raw_hidden_states[offset : offset + take],
+                            chunk.positions[offset : offset + take],
+                            take,
+                        )
+                    )
+                    pending_tokens += take
+                    offset += take
+                    remaining -= take
+        flush()
+
+    def _project_context_kv(
+        self,
+        raw_hidden: torch.Tensor,
+        positions: torch.Tensor,
+        req_row_map_cpu: torch.Tensor,
+        req_start_loc_cpu: torch.Tensor,
+    ) -> None:
+        """Combine raw aux hidden and write DSpark context KV for one pack."""
+        num_tokens = raw_hidden.shape[0]
+        if num_tokens == 0:
+            return
+        combined = self.model.combine_hidden_states(raw_hidden)
+        req_start_loc_gpu = req_start_loc_cpu.to(self.device, non_blocking=True)
+        req_row_map_gpu = req_row_map_cpu.to(self.device, non_blocking=True)
+        per_group_slots: dict[int, torch.Tensor] = {}
+        for attn_group in self.draft_attn_groups:
+            gid = attn_group.kv_cache_group_id
+            block_table = self._per_group_block_tables.get(gid)
+            if block_table is None:
+                raise RuntimeError(
+                    f"[dspark/decode_only] missing current block table for draft "
+                    f"KV group {gid}; cannot rebuild context slots."
+                )
+            out_slots = self._lazy_init_slot_buffers[gid][:num_tokens]
+            if out_slots.shape[0] < num_tokens:
+                raise RuntimeError(
+                    "[dspark/decode_only] lazy-init pack ({} tokens) exceeds the "
+                    "preallocated slot buffer ({}); check lazy_init_chunk_tokens.".format(
+                        num_tokens, self._lazy_init_slot_buffers[gid].shape[0]
+                    )
+                )
+            build_dspark_context_slots(
+                positions=positions,
+                req_row_map=req_row_map_gpu,
+                req_start_loc=req_start_loc_gpu,
+                block_table=block_table,
+                block_size=int(attn_group.kv_cache_spec.block_size),
+                out_slots=out_slots,
+            )
+            per_group_slots[gid] = out_slots
+        slots_by_layer = [per_group_slots[gidx] for gidx in self._layer_group_idx]
+        self.model.precompute_and_store_context_kv(combined, positions, slots_by_layer)
+
+    def _mark_rows_proposed(
+        self,
+        meta: DSparkDecodeOnlyRequestMeta,
+        pending_rows: list[int],
+        fallback_final_rows: list[int],
+    ) -> None:
+        """Atomically switch requests to READY after a successful proposal."""
+        for row in pending_rows:
+            ctx = self._pending_contexts.get(meta.request_ids[row])
+            if ctx is None or ctx.phase != DSparkRequestPhase.PENDING_INIT:
+                continue
+            self._release_staging(ctx)
+            ctx.phase = DSparkRequestPhase.READY
+        for row in fallback_final_rows:
+            ctx = self._pending_contexts.get(meta.request_ids[row])
+            if ctx is None or ctx.phase != DSparkRequestPhase.FALLBACK_PREFILL:
+                continue
+            ctx.phase = DSparkRequestPhase.READY
+        self._refresh_staging_stats()
+
+    # ------------------------------------------------------------------
+    # Decode-only: orchestration entry point
+    # ------------------------------------------------------------------
+
+    def propose_decode_only(
+        self,
+        *,
+        scheduler_output,
+        common_attn_metadata: CommonAttentionMetadata,
+        token_indices: torch.Tensor | None,
+        token_indices_to_sample: torch.Tensor | None,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        next_token_ids: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        raw_target_hidden_states: torch.Tensor,
+        num_scheduled_tokens: dict[str, int],
+        req_ids: list[str],
+        num_computed_tokens_cpu,
+        num_prompt_tokens,
+        target_model_batch_desc,
+        sampling_metadata,
+    ) -> torch.Tensor:
+        """DSpark decode-only orchestration: stage, lazy-init, propose, scatter."""
+        with record_function_or_nullcontext("dspark_decode_proposal"):
+            return self._propose_decode_only_impl(
+                scheduler_output=scheduler_output,
+                common_attn_metadata=common_attn_metadata,
+                token_indices=token_indices,
+                token_indices_to_sample=token_indices_to_sample,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                next_token_ids=next_token_ids,
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                raw_target_hidden_states=raw_target_hidden_states,
+                num_scheduled_tokens=num_scheduled_tokens,
+                req_ids=req_ids,
+                num_computed_tokens_cpu=num_computed_tokens_cpu,
+                num_prompt_tokens=num_prompt_tokens,
+                target_model_batch_desc=target_model_batch_desc,
+                sampling_metadata=sampling_metadata,
+            )
+
+    def _propose_decode_only_impl(
+        self,
+        *,
+        scheduler_output,
+        common_attn_metadata: CommonAttentionMetadata,
+        token_indices: torch.Tensor | None,
+        token_indices_to_sample: torch.Tensor | None,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        next_token_ids: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        raw_target_hidden_states: torch.Tensor,
+        num_scheduled_tokens: dict[str, int],
+        req_ids: list[str],
+        num_computed_tokens_cpu,
+        num_prompt_tokens,
+        target_model_batch_desc,
+        sampling_metadata,
+    ) -> torch.Tensor:
+        del token_indices  # target tensors are already gathered by the runner.
+        num_reqs = len(req_ids)
+        meta = self.classify_decode_only_requests(
+            req_ids, num_computed_tokens_cpu, num_prompt_tokens, num_scheduled_tokens
+        )
+
+        if any(meta.is_prefill):
+            with record_function_or_nullcontext("dspark_stage_context"):
+                self.stage_prefill_context(
+                    meta,
+                    raw_target_hidden_states,
+                    target_positions,
+                    common_attn_metadata.query_start_loc_cpu,
+                )
+
+        pending_rows, ready_rows, fallback_final_rows = self._collect_eligible_rows(meta)
+        if pending_rows:
+            with record_function_or_nullcontext("dspark_lazy_init"):
+                self.initialize_pending_contexts([req_ids[row] for row in pending_rows], pending_rows)
+
+        eligible_rows = sorted(pending_rows + ready_rows + fallback_final_rows)
+        full_drafts = torch.zeros((num_reqs, self.num_speculative_tokens), dtype=torch.int64, device=self.device)
+        valid_mask = [False] * num_reqs
+
+        if eligible_rows:
+            sub_drafts = self._propose_compact(
+                eligible_rows=eligible_rows,
+                common_attn_metadata=common_attn_metadata,
+                token_indices_to_sample=token_indices_to_sample,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                next_token_ids=next_token_ids,
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                raw_target_hidden_states=raw_target_hidden_states,
+                target_model_batch_desc=target_model_batch_desc,
+                sampling_metadata=sampling_metadata,
+                scheduler_output=scheduler_output,
+            )
+            if len(eligible_rows) == num_reqs:
+                full_drafts = sub_drafts
+            else:
+                rows_gpu = torch.tensor(eligible_rows, dtype=torch.int64, device=self.device)
+                full_drafts.index_copy_(0, rows_gpu, sub_drafts)
+            for row in eligible_rows:
+                valid_mask[row] = True
+            self._mark_rows_proposed(meta, pending_rows, fallback_final_rows)
+
+        self._last_draft_valid_mask = valid_mask
+        return full_drafts
+
+    def _propose_compact(
+        self,
+        *,
+        eligible_rows: list[int],
+        common_attn_metadata: CommonAttentionMetadata,
+        token_indices_to_sample: torch.Tensor | None,
+        num_rejected_tokens_gpu: torch.Tensor | None,
+        next_token_ids: torch.Tensor,
+        target_token_ids: torch.Tensor,
+        target_positions: torch.Tensor,
+        raw_target_hidden_states: torch.Tensor,
+        target_model_batch_desc,
+        sampling_metadata,
+        scheduler_output,
+    ) -> torch.Tensor:
+        """Run the existing ``_propose`` path on the eligible subbatch."""
+        num_reqs = common_attn_metadata.num_reqs
+        identity = eligible_rows == list(range(num_reqs))
+        if identity:
+            return self._propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=raw_target_hidden_states,
+                next_token_ids=next_token_ids,
+                token_indices_to_sample=token_indices_to_sample,
+                common_attn_metadata=common_attn_metadata,
+                target_model_batch_desc=target_model_batch_desc,
+                sampling_metadata=sampling_metadata,
+                req_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            )
+
+        m = len(eligible_rows)
+        qsl_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1].to(torch.int32)
+        qsl_np = qsl_cpu.numpy()
+        eligible_np = np.asarray(eligible_rows, dtype=np.int64)
+        counts_np = (qsl_np[eligible_np + 1] - qsl_np[eligible_np]).astype(np.int32)
+        total_tokens = int(counts_np.sum())
+        new_qsl_np = np.zeros(m + 1, dtype=np.int32)
+        np.cumsum(counts_np, out=new_qsl_np[1:])
+        # Compact-token index: old flat index of every retained token.
+        old_starts = np.repeat(qsl_np[eligible_np], counts_np)
+        new_starts = np.repeat(new_qsl_np[:-1], counts_np)
+        offsets = np.arange(total_tokens, dtype=np.int32) - new_starts
+        compact_idx_np = old_starts + offsets
+
+        compact_idx_gpu = torch.from_numpy(compact_idx_np).to(self.device, non_blocking=True)
+        compact_idx_long = compact_idx_gpu.to(torch.int64)
+        rows_gpu = torch.from_numpy(eligible_np).to(self.device, non_blocking=True)
+
+        sub_token_ids = target_token_ids.index_select(0, compact_idx_long)
+        sub_positions = target_positions.index_select(0, compact_idx_long)
+        sub_hidden = raw_target_hidden_states.index_select(0, compact_idx_long)
+        sub_next = next_token_ids.index_select(0, rows_gpu)
+        sub_rejected = (
+            num_rejected_tokens_gpu.index_select(0, rows_gpu) if num_rejected_tokens_gpu is not None else None
+        )
+        sub_tits = token_indices_to_sample.index_select(0, rows_gpu) if token_indices_to_sample is not None else None
+
+        cad_sub = copy.copy(common_attn_metadata)
+        cad_sub.num_reqs = m
+        new_qsl_cpu = torch.from_numpy(new_qsl_np)
+        cad_sub.query_start_loc_cpu = new_qsl_cpu
+        cad_sub.query_start_loc = new_qsl_cpu.to(self.device, non_blocking=True)
+        if getattr(cad_sub, "seq_lens", None) is not None:
+            cad_sub.seq_lens = common_attn_metadata.seq_lens.index_select(0, rows_gpu)
+        if getattr(cad_sub, "block_table_tensor", None) is not None:
+            cad_sub.block_table_tensor = common_attn_metadata.block_table_tensor.index_select(0, rows_gpu)
+        if getattr(cad_sub, "num_computed_tokens_cpu", None) is not None:
+            cad_sub.num_computed_tokens_cpu = common_attn_metadata.num_computed_tokens_cpu[eligible_np]
+
+        # Per-group runner tensors must follow the compact layout: the DSpark
+        # first-pass kernel indexes them by subbatch row / compact token.
+        saved_block_tables = self._per_group_block_tables
+        saved_slot_mappings = self._per_group_slot_mappings
+        try:
+            self._per_group_block_tables = {gid: bt.index_select(0, rows_gpu) for gid, bt in saved_block_tables.items()}
+            self._per_group_slot_mappings = {
+                gid: sm.index_select(0, compact_idx_gpu) for gid, sm in saved_slot_mappings.items()
+            }
+            return self._propose(
+                target_token_ids=sub_token_ids,
+                target_positions=sub_positions,
+                target_hidden_states=sub_hidden,
+                next_token_ids=sub_next,
+                token_indices_to_sample=sub_tits,
+                common_attn_metadata=cad_sub,
+                target_model_batch_desc=target_model_batch_desc,
+                sampling_metadata=sampling_metadata,
+                req_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                num_rejected_tokens_gpu=sub_rejected,
+            )
+        finally:
+            self._per_group_block_tables = saved_block_tables
+            self._per_group_slot_mappings = saved_slot_mappings
+
     def initialize_attn_backend(self, kv_cache_config, kernel_block_sizes=None) -> None:
         # Find draft layers (attention layers added by draft model)
         all_attn_layers = get_layers_from_vllm_config(
@@ -180,6 +1030,44 @@ class AscendDSparkProposer(AscendDflashProposer):
             attn_group.kv_cache_group_id: torch.zeros(self.max_num_tokens, dtype=torch.int32, device=self.device)
             for attn_group in self.draft_attn_groups
         }
+
+        if self.decode_only:
+            self._init_decode_only_attn_state()
+
+    def _init_decode_only_attn_state(self) -> None:
+        """Derive the retained-context window and allocate lazy-init buffers.
+
+        Runs after ``load_model`` and after the draft attention groups are
+        registered, so draft model capabilities can be verified here.
+        """
+        for method_name in ("combine_hidden_states", "precompute_and_store_context_kv"):
+            if not callable(getattr(self.model, method_name, None)):
+                raise RuntimeError(
+                    "DSpark decode_only requires the draft model to expose "
+                    f"`{method_name}()`; the loaded draft model does not."
+                )
+        _, _, chunk_tokens = self._decode_only_limits()
+        windows: list[int] = []
+        has_full_attention = False
+        for attn_group in self.draft_attn_groups:
+            spec = attn_group.kv_cache_spec
+            sliding_window = getattr(spec, "sliding_window", None)
+            if isinstance(sliding_window, int) and sliding_window > 0:
+                windows.append(sliding_window)
+            else:
+                has_full_attention = True
+        if has_full_attention:
+            self._dspark_retained_context_tokens = None
+        else:
+            self._dspark_retained_context_tokens = max(windows)
+        self._lazy_init_slot_buffers = {
+            attn_group.kv_cache_group_id: torch.zeros(chunk_tokens, dtype=torch.int32, device=self.device)
+            for attn_group in self.draft_attn_groups
+        }
+        logger.info(
+            "[dspark/decode_only] retained_context_tokens=%s",
+            self._dspark_retained_context_tokens,
+        )
 
     def set_per_group_attn_metadata(
         self,

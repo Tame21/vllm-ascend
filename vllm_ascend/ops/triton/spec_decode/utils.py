@@ -15,6 +15,7 @@
 #
 # Adapted from https://github.com/vllm-project/vllm/blob/main/vllm/v1/spec_decode/utils.py
 
+import torch
 from vllm.triton_utils import tl, triton
 
 
@@ -144,3 +145,66 @@ def copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid(
             if q_idx > 0:
                 sample_out_idx = req_idx * num_speculative_tokens + (q_idx - 1)
                 tl.store(out_token_indices_ptr + sample_out_idx, query_out_idx)
+
+
+@triton.jit
+def build_dspark_context_slots_kernel(
+    positions_ptr,  # [num_context_tokens] flattened retained target positions
+    req_row_map_ptr,  # [num_reqs] compact subbatch row -> full batch row
+    req_start_loc_ptr,  # [num_reqs + 1] per-request token start in the flat array
+    block_table_ptr,  # [max_reqs, max_blocks] full-batch block table (one per group)
+    block_table_stride,  # stride of block_table dim 0 (in elements)
+    out_slots_ptr,  # [num_context_tokens] output slots for this group
+    block_size,  # tl.int32, KV group block size
+    num_reqs,  # tl.int32
+):
+    # Rebuild DSpark context slots from retained positions and the *current*
+    # block table. Used by DSpark decode-only lazy init; staged slot mappings
+    # are never trusted because sliding-window managers may recycle blocks.
+    req_idx = tl.program_id(axis=0)
+    if req_idx >= num_reqs:
+        return
+
+    token_start = tl.load(req_start_loc_ptr + req_idx)
+    token_end = tl.load(req_start_loc_ptr + req_idx + 1)
+    full_row = tl.load(req_row_map_ptr + req_idx).to(tl.int64)
+
+    for i in range(token_start, token_end):
+        pos = tl.load(positions_ptr + i)
+        block_num = pos // block_size
+        block_id = tl.load(block_table_ptr + full_row * block_table_stride + block_num).to(tl.int64)
+        slot = block_id * block_size + (pos % block_size)
+        tl.store(out_slots_ptr + i, slot)
+
+
+def build_dspark_context_slots(
+    positions: "torch.Tensor",
+    req_row_map: "torch.Tensor",
+    req_start_loc: "torch.Tensor",
+    block_table: "torch.Tensor",
+    block_size: int,
+    out_slots: "torch.Tensor",
+) -> None:
+    """Batch-rebuild per-group DSpark context slots on device.
+
+    Args:
+        positions: flattened retained target positions [num_context_tokens].
+        req_row_map: compact-row -> full-batch-row mapping [num_reqs], int32.
+        req_start_loc: per-request token starts [num_reqs + 1], int32.
+        block_table: current full-batch block table of one draft KV group.
+        block_size: block size of that draft KV group.
+        out_slots: output slot buffer [num_context_tokens], int32/int64.
+    """
+    num_reqs = req_row_map.shape[0]
+    if num_reqs == 0:
+        return
+    build_dspark_context_slots_kernel[num_reqs,](
+        positions_ptr=positions,
+        req_row_map_ptr=req_row_map.to(torch.int32),
+        req_start_loc_ptr=req_start_loc.to(torch.int32),
+        block_table_ptr=block_table,
+        block_table_stride=block_table.stride(0),
+        out_slots_ptr=out_slots,
+        block_size=block_size,
+        num_reqs=num_reqs,
+    )

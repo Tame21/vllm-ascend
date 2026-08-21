@@ -590,6 +590,9 @@ class NPUModelRunner(GPUModelRunner):
                 self.rejection_sampler = AscendRejectionSampler(self.sampler)
         self.discard_request_indices = self._make_buffer(self.max_num_reqs, dtype=torch.int64)
         self.num_discarded_requests = 0
+        # DSpark decode-only: per-row draft validity aligned with
+        # _draft_token_req_ids; None means every row is a real draft.
+        self._draft_token_valid_mask_cpu: list[bool] | None = None
 
     def _get_drafter(self):
         return get_spec_decode_method(self.speculative_config.method, self.vllm_config, self.device, self)
@@ -759,8 +762,37 @@ class NPUModelRunner(GPUModelRunner):
                 if num_computed_tokens < req_state.num_computed_tokens:
                     req_state.prev_num_draft_len = 0
 
+        # DSpark decode-only lifecycle hooks. Must run before
+        # super()._update_states() overwrites req_state.num_computed_tokens.
+        if self._is_dspark_decode_only():
+            assert isinstance(self.drafter, AscendDSparkProposer)
+            if scheduler_output.finished_req_ids:
+                self.drafter.release_requests(scheduler_output.finished_req_ids)
+            resumed = set(req_data.resumed_req_ids)
+            if resumed:
+                self.drafter.invalidate_requests(resumed, reason="resumed")
+            rewind: set[str] = set()
+            for i, req_id in enumerate(req_data.req_ids):
+                if req_id in resumed:
+                    continue
+                req_state = self.requests.get(req_id)
+                if req_state is None:
+                    continue
+                if req_data.num_computed_tokens[i] < req_state.num_computed_tokens:
+                    rewind.add(req_id)
+            if rewind:
+                self.drafter.invalidate_requests(rewind, reason="rewind")
+
         self._apply_pp_sampled_tokens_from_scheduler_output(scheduler_output)
         return super()._update_states(scheduler_output)
+
+    def _is_dspark_decode_only(self) -> bool:
+        return (
+            self.speculative_config is not None
+            and self.speculative_config.use_dspark()
+            and isinstance(self.drafter, AscendDSparkProposer)
+            and self.drafter.decode_only
+        )
 
     def _pad_query_start_loc_for_fia(
         self,
@@ -1603,6 +1635,30 @@ class NPUModelRunner(GPUModelRunner):
                     target_hidden_states = torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)
                 else:
                     target_hidden_states = hidden_states[token_indices]
+
+            # DSpark decode-only: keep all DSpark computation out of prefill
+            # steps; run lazy init + compact proposal after the first ordinary
+            # decode instead. Must precede the generic _propose() call.
+            if self._is_dspark_decode_only():
+                assert isinstance(self.drafter, AscendDSparkProposer)
+                return self.drafter.propose_decode_only(
+                    scheduler_output=scheduler_output,
+                    common_attn_metadata=common_attn_metadata,
+                    token_indices=token_indices if spec_decode_metadata is not None else None,
+                    token_indices_to_sample=token_indices_to_sample,
+                    num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                    next_token_ids=next_token_ids,
+                    target_token_ids=target_token_ids,
+                    target_positions=target_positions,
+                    raw_target_hidden_states=target_hidden_states,
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    req_ids=self.input_batch.req_ids,
+                    num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu,
+                    num_prompt_tokens=self.input_batch.num_prompt_tokens,
+                    target_model_batch_desc=target_model_batch_desc,
+                    sampling_metadata=sampling_metadata,
+                )
+
             assert self.drafter is not None
             draft_token_ids = self.drafter._propose(
                 target_token_ids=target_token_ids,
@@ -1682,6 +1738,14 @@ class NPUModelRunner(GPUModelRunner):
         ):
             return
         self._draft_token_req_ids = self.input_batch.req_ids.copy()
+        # DSpark decode-only: snapshot the per-request valid mask with the
+        # same lifecycle as _draft_token_req_ids so invalid rows can later be
+        # converted to true empty lists.
+        if self._is_dspark_decode_only():
+            assert isinstance(self.drafter, AscendDSparkProposer)
+            self._draft_token_valid_mask_cpu = self.drafter.take_last_draft_valid_mask()
+        else:
+            self._draft_token_valid_mask_cpu = None
 
         draft_token_ids: torch.Tensor = self._draft_token_ids  # type: ignore[has-type]
         if not torch.is_tensor(draft_token_ids):
@@ -1700,6 +1764,15 @@ class NPUModelRunner(GPUModelRunner):
             else:
                 self.draft_token_ids_cpu[:num_reqs] = 0
             self.draft_token_ids_event.record()
+
+    def _get_draft_token_ids_cpu(self) -> tuple[list[list[int]], list[str]]:
+        draft_token_ids, req_ids = super()._get_draft_token_ids_cpu()
+        valid_mask = self._draft_token_valid_mask_cpu
+        if valid_mask is None:
+            return draft_token_ids, req_ids
+        # DSpark decode-only: placeholder rows (e.g. collecting / final
+        # prefill) must surface as real empty lists, never as K zeros.
+        return [row if valid else [] for row, valid in zip(draft_token_ids, valid_mask)], req_ids
 
     @torch.inference_mode()
     def execute_model(
@@ -2223,6 +2296,7 @@ class NPUModelRunner(GPUModelRunner):
             if early_pp_padded_drafter:
                 self._draft_token_ids = None
                 self._draft_token_req_ids = None
+                self._draft_token_valid_mask_cpu = None
                 with record_function_or_nullcontext("draft_token"):
                     propose_draft_token_ids(sampler_output.sampled_token_ids)
 
@@ -2247,6 +2321,7 @@ class NPUModelRunner(GPUModelRunner):
                 if not early_pp_padded_drafter:
                     self._draft_token_ids = None
                     self._draft_token_req_ids = None
+                    self._draft_token_valid_mask_cpu = None
                 if use_padded_batch and not early_pp_padded_drafter:
                     # EAGLE speculative decoding can use the GPU sampled tokens
                     # as inputs, and does not need to wait for bookkeeping to finish.
@@ -2268,6 +2343,14 @@ class NPUModelRunner(GPUModelRunner):
                     num_reqs = draft_token_ids.shape[0]
                     draft_ids_list = draft_token_ids[:num_reqs].cpu().tolist()
                     draft_req_ids = self._draft_token_req_ids
+                    if self._draft_token_valid_mask_cpu is not None:
+                        # DSpark decode-only PP path: apply the same
+                        # per-request mask as _get_draft_token_ids_cpu so
+                        # placeholder rows are never published as spec tokens.
+                        draft_ids_list = [
+                            row if valid else []
+                            for row, valid in zip(draft_ids_list, self._draft_token_valid_mask_cpu)
+                        ]
                 else:
                     draft_ids_list = draft_token_ids
                     draft_req_ids = self.input_batch.req_ids

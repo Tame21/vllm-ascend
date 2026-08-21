@@ -175,6 +175,36 @@ MTP (Multi-Token Prediction) boosts inference performance by parallelizing the p
 >
 > In the fullgraph mode with `num_speculative_tokens > 1`, the capture size of each ACLGraph must be an integer multiple of `(num_speculative_tokens + 1)`.
 
+## DSpark decode-only prefill
+
+By default (`execution_phase=prefill_tail`), DSpark projects the target context KV and runs its first proposal inside the final prefill step, so the first output token also waits for that DSpark work. With `execution_phase=decode_only`, vLLM Ascend defers all DSpark computation out of prefill: prefill only stages the raw target auxiliary hidden states (plus their positions) on the NPU, the final prefill publishes an empty draft list and returns the first token immediately, and the staged context is lazily projected into the DSpark KV cache right after the first ordinary decode, which then emits the first `num_speculative_tokens` draft tokens. Steady-state speculative decoding is unchanged.
+
+```shell
+vllm serve <target-model> \
+    --speculative-config '{"method":"dspark","model":"<draft-model>","num_speculative_tokens":7,"enforce_eager":true}' \
+    --additional-config '{"dspark_config":{"execution_phase":"decode_only","staging_device":"npu","max_staged_tokens_per_request":32768,"max_staged_bytes_total":2147483648,"lazy_init_chunk_tokens":4096,"overflow_policy":"fallback_prefill_tail"}}' \
+    --no-enable-prefix-caching \
+    --no-async-scheduling
+```
+
+Configuration fields:
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `execution_phase` | `prefill_tail` | `decode_only` moves DSpark context projection and the first proposal out of the prefill critical path. |
+| `staging_device` | `npu` | Device holding the staged raw hidden states; only `npu` is supported. |
+| `max_staged_tokens_per_request` | required | Upper bound of retained staged tokens per request; must cover the prompt (or the sliding window when all draft layers are sliding-window). |
+| `max_staged_bytes_total` | required | Upper bound of the total staged bytes per worker. |
+| `lazy_init_chunk_tokens` | `4096` | Maximum context tokens combined and projected per lazy-init pack, bounding the temporary workspace. |
+| `overflow_policy` | `fallback_prefill_tail` | When a limit is exceeded, only the offending request falls back to incremental prefill-side context writes. |
+
+Trade-offs and constraints:
+
+- TTFT no longer waits for DSpark, while the first inter-token latency (ITL) absorbs the deferred lazy initialization; report the first ITL separately when benchmarking.
+- Staging memory is roughly `retained_tokens * sum(target_aux_hidden_widths) * dtype_size` per request, which is why both limits must be configured explicitly.
+- `decode_only` requires Model Runner V1 (the default on Ascend), synchronous scheduling, prefix caching disabled, no KV transfer / PD disaggregation, and `decode_context_parallel_size=1`; unsupported combinations fail at startup.
+- If a request exceeds a staging limit, it deterministically falls back to the `prefill_tail` behavior for itself only; other requests keep the decode-only path.
+
 ## Speculating using Suffix Decoding
 
 The following code configures vLLM to use speculative decoding where proposals are generated using Suffix Decoding [(SuffixDecoding: Extreme Speculative Decoding for Emerging AI Applications)](https://arxiv.org/abs/2411.04975).

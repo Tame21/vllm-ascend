@@ -46,6 +46,9 @@ class AscendConfig:
         finegrained_tp_config = additional_config.get("finegrained_tp_config", {})
         self.finegrained_tp_config = FinegrainedTPConfig(finegrained_tp_config, vllm_config)
 
+        dspark_config = additional_config.get("dspark_config", {})
+        self.dspark_config = DSparkExecutionConfig(dspark_config, vllm_config)
+
         eplb_config = additional_config.get("eplb_config", {})
         self.eplb_config = EplbConfig(eplb_config)
 
@@ -757,6 +760,127 @@ class RejectionSamplerConfig:
             )
         if self.posterior_alpha < 0:
             raise ValueError(f"rejection_sampler_config.posterior_alpha must be >= 0, got {self.posterior_alpha}")
+
+
+class DSparkExecutionConfig:
+    """Configuration for the DSpark first-proposal execution phase.
+
+    Controls whether the DSpark context-KV projection and the first draft
+    proposal run inside the final prefill step (``prefill_tail``, the
+    historical behavior) or are deferred to after the first ordinary decode
+    step (``decode_only``).
+
+    Usage::
+
+        vllm serve <model> --additional-config '{"dspark_config": \\
+            {"execution_phase": "decode_only", \\
+             "max_staged_tokens_per_request": 32768, \\
+             "max_staged_bytes_total": 2147483648}}'
+    """
+
+    _VALID_EXECUTION_PHASES = ("prefill_tail", "decode_only")
+    _VALID_STAGING_DEVICES = ("npu",)
+    _VALID_OVERFLOW_POLICIES = ("fallback_prefill_tail",)
+
+    def __init__(self, dspark_config: dict[str, Any], vllm_config: "VllmConfig"):
+        if not isinstance(dspark_config, dict):
+            raise ValueError(f"additional_config.dspark_config must be a dict, got {type(dspark_config).__name__}.")
+
+        self.execution_phase: str = dspark_config.get("execution_phase", "prefill_tail")
+        self.staging_device: str = dspark_config.get("staging_device", "npu")
+        self.max_staged_tokens_per_request: int | None = dspark_config.get("max_staged_tokens_per_request")
+        self.max_staged_bytes_total: int | None = dspark_config.get("max_staged_bytes_total")
+        self.lazy_init_chunk_tokens: int = dspark_config.get("lazy_init_chunk_tokens", 4096)
+        self.overflow_policy: str = dspark_config.get("overflow_policy", "fallback_prefill_tail")
+        # Convenience flag for hot-path checks.
+        self.decode_only: bool = self.execution_phase == "decode_only"
+
+        self._validate(vllm_config)
+
+    def _validate(self, vllm_config: "VllmConfig") -> None:
+        if self.execution_phase not in self._VALID_EXECUTION_PHASES:
+            raise ValueError(
+                "dspark_config.execution_phase must be one of "
+                f"{self._VALID_EXECUTION_PHASES}, got {self.execution_phase!r}."
+            )
+        if self.staging_device not in self._VALID_STAGING_DEVICES:
+            raise ValueError(
+                "dspark_config.staging_device must be one of "
+                f"{self._VALID_STAGING_DEVICES}, got {self.staging_device!r}."
+            )
+        if self.overflow_policy not in self._VALID_OVERFLOW_POLICIES:
+            raise ValueError(
+                "dspark_config.overflow_policy must be one of "
+                f"{self._VALID_OVERFLOW_POLICIES}, got {self.overflow_policy!r}."
+            )
+        self._validate_positive_int("lazy_init_chunk_tokens", self.lazy_init_chunk_tokens, required=True)
+        if self.max_staged_tokens_per_request is not None:
+            self._validate_positive_int(
+                "max_staged_tokens_per_request", self.max_staged_tokens_per_request, required=False
+            )
+        if self.max_staged_bytes_total is not None:
+            self._validate_positive_int("max_staged_bytes_total", self.max_staged_bytes_total, required=False)
+
+        if not self.decode_only:
+            # prefill_tail keeps the historical behavior; no further checks.
+            return
+
+        if self.max_staged_tokens_per_request is None or self.max_staged_bytes_total is None:
+            raise ValueError(
+                "dspark_config.execution_phase=decode_only requires explicit "
+                "max_staged_tokens_per_request and max_staged_bytes_total to "
+                "bound raw auxiliary hidden-state staging memory."
+            )
+
+        speculative_config = getattr(vllm_config, "speculative_config", None)
+        if speculative_config is None or speculative_config.method != "dspark":
+            method = getattr(speculative_config, "method", None)
+            raise ValueError(
+                "dspark_config.execution_phase=decode_only requires "
+                f"speculative_config.method='dspark', got {method!r}."
+            )
+
+        cache_config = getattr(vllm_config, "cache_config", None)
+        if cache_config is not None and cache_config.enable_prefix_caching:
+            raise ValueError(
+                "dspark_config.execution_phase=decode_only is not compatible with "
+                "prefix caching: a cache hit skips target auxiliary hidden states. "
+                "Please disable prefix caching (--no-enable-prefix-caching)."
+            )
+
+        scheduler_config = getattr(vllm_config, "scheduler_config", None)
+        if scheduler_config is not None and scheduler_config.async_scheduling:
+            raise ValueError(
+                "dspark_config.execution_phase=decode_only does not support async "
+                "scheduling. Please disable it (--no-async-scheduling)."
+            )
+
+        kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+        if kv_transfer_config is not None and kv_transfer_config.is_kv_transfer_instance:
+            raise ValueError(
+                "dspark_config.execution_phase=decode_only does not support KV transfer / PD disaggregation."
+            )
+
+        if getattr(vllm_config, "use_v2_model_runner", False):
+            raise ValueError(
+                "dspark_config.execution_phase=decode_only is only implemented for "
+                "Model Runner V1. Please unset VLLM_USE_V2_MODEL_RUNNER."
+            )
+
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        if parallel_config is not None and parallel_config.decode_context_parallel_size > 1:
+            raise ValueError("dspark_config.execution_phase=decode_only requires decode_context_parallel_size=1.")
+
+    @staticmethod
+    def _validate_positive_int(field_name: str, value: Any, required: bool) -> None:
+        # bool is a subclass of int; reject it explicitly so users cannot
+        # silently pass `true` (== 1) through JSON configs.
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(
+                f"dspark_config.{field_name} must be a positive int, got {type(value).__name__}: {value!r}."
+            )
+        if value <= 0:
+            raise ValueError(f"dspark_config.{field_name} must be a positive int, got {value}.")
 
 
 class EplbConfig:

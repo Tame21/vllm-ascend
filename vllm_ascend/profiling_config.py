@@ -118,6 +118,10 @@ SERVICE_PROFILING_SYMBOLS_YAML = f"""
   min_version: "0.9.1"
   handler: ms_service_profiler.patcher.vllm.handlers.v1.mtp_handlers:propose_draft_token_ids_npu
 
+- symbol: vllm_ascend.spec_decode.dspark_proposer:AscendDSparkProposer.propose_decode_only
+  min_version: "0.9.1"
+  name: dspark_decode_only.propose
+
 - symbol: vllm_ascend.sample.rejection_sampler:rejection_sample
   min_version: "0.9.1"
   handler: ms_service_profiler.patcher.vllm.handlers.v1.mtp_handlers:capture_rejection_output

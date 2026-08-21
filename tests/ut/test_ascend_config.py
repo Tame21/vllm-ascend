@@ -22,6 +22,7 @@ from vllm.config import KVTransferConfig, VllmConfig
 
 from tests.ut.base import TestBase
 from vllm_ascend.ascend_config import (
+    DSparkExecutionConfig,
     SchedulerConfig,
     ShortRequestFirstConfig,
     clear_ascend_config,
@@ -571,3 +572,144 @@ class TestSchedulerConfig(TestBase):
 
         self.assertTrue(config.enable_balance_scheduling)
         mock_info_once.assert_called_once()
+
+
+class TestDSparkExecutionConfig(TestBase):
+    """Validation tests for additional_config["dspark_config"]."""
+
+    @staticmethod
+    def _make_vllm_config(
+        *,
+        spec_method: str | None = "dspark",
+        enable_prefix_caching: bool = False,
+        async_scheduling: bool = False,
+        has_kv_transfer: bool = False,
+        use_v2_model_runner: bool = False,
+        decode_context_parallel_size: int = 1,
+    ):
+        kv_transfer_config = None
+        if has_kv_transfer:
+            kv_transfer_config = SimpleNamespace(is_kv_transfer_instance=True)
+        return SimpleNamespace(
+            speculative_config=(SimpleNamespace(method=spec_method) if spec_method is not None else None),
+            cache_config=SimpleNamespace(enable_prefix_caching=enable_prefix_caching),
+            scheduler_config=SimpleNamespace(async_scheduling=async_scheduling),
+            kv_transfer_config=kv_transfer_config,
+            use_v2_model_runner=use_v2_model_runner,
+            parallel_config=SimpleNamespace(decode_context_parallel_size=decode_context_parallel_size),
+        )
+
+    @staticmethod
+    def _decode_only_config(**overrides):
+        config = {
+            "execution_phase": "decode_only",
+            "max_staged_tokens_per_request": 32768,
+            "max_staged_bytes_total": 2147483648,
+        }
+        config.update(overrides)
+        return config
+
+    def test_default_is_prefill_tail_and_changes_nothing(self):
+        cfg = DSparkExecutionConfig({}, self._make_vllm_config())
+        self.assertEqual(cfg.execution_phase, "prefill_tail")
+        self.assertFalse(cfg.decode_only)
+        self.assertEqual(cfg.staging_device, "npu")
+        self.assertEqual(cfg.lazy_init_chunk_tokens, 4096)
+        self.assertEqual(cfg.overflow_policy, "fallback_prefill_tail")
+
+    def test_prefill_tail_ignores_unsupported_combinations(self):
+        # prefill_tail keeps the historical behavior: no feature-combination
+        # checks fire (they only apply to decode_only).
+        vllm_config = self._make_vllm_config(
+            enable_prefix_caching=True,
+            async_scheduling=True,
+            has_kv_transfer=True,
+            use_v2_model_runner=True,
+            decode_context_parallel_size=2,
+        )
+        cfg = DSparkExecutionConfig({"execution_phase": "prefill_tail"}, vllm_config)
+        self.assertFalse(cfg.decode_only)
+
+    def test_decode_only_requires_explicit_limits(self):
+        with self.assertRaisesRegex(ValueError, "max_staged_tokens_per_request"):
+            DSparkExecutionConfig({"execution_phase": "decode_only"}, self._make_vllm_config())
+        with self.assertRaisesRegex(ValueError, "max_staged_tokens_per_request"):
+            DSparkExecutionConfig(
+                {"execution_phase": "decode_only", "max_staged_bytes_total": 1024},
+                self._make_vllm_config(),
+            )
+        with self.assertRaisesRegex(ValueError, "max_staged_tokens_per_request"):
+            DSparkExecutionConfig(
+                {"execution_phase": "decode_only", "max_staged_tokens_per_request": 128},
+                self._make_vllm_config(),
+            )
+
+    def test_decode_only_requires_dspark_method(self):
+        vllm_config = self._make_vllm_config(spec_method="eagle3")
+        with self.assertRaisesRegex(ValueError, "method='dspark'"):
+            DSparkExecutionConfig(self._decode_only_config(), vllm_config)
+        with self.assertRaisesRegex(ValueError, "method='dspark'"):
+            DSparkExecutionConfig(self._decode_only_config(), self._make_vllm_config(spec_method=None))
+
+    def test_decode_only_rejects_prefix_caching(self):
+        vllm_config = self._make_vllm_config(enable_prefix_caching=True)
+        with self.assertRaisesRegex(ValueError, "prefix caching"):
+            DSparkExecutionConfig(self._decode_only_config(), vllm_config)
+
+    def test_decode_only_rejects_async_scheduling(self):
+        vllm_config = self._make_vllm_config(async_scheduling=True)
+        with self.assertRaisesRegex(ValueError, "async"):
+            DSparkExecutionConfig(self._decode_only_config(), vllm_config)
+
+    def test_decode_only_rejects_kv_transfer(self):
+        vllm_config = self._make_vllm_config(has_kv_transfer=True)
+        with self.assertRaisesRegex(ValueError, "KV"):
+            DSparkExecutionConfig(self._decode_only_config(), vllm_config)
+
+    def test_decode_only_rejects_v2_model_runner(self):
+        vllm_config = self._make_vllm_config(use_v2_model_runner=True)
+        with self.assertRaisesRegex(ValueError, "Model Runner V1"):
+            DSparkExecutionConfig(self._decode_only_config(), vllm_config)
+
+    def test_decode_only_rejects_dcp_greater_than_one(self):
+        vllm_config = self._make_vllm_config(decode_context_parallel_size=2)
+        with self.assertRaisesRegex(ValueError, "decode_context_parallel_size"):
+            DSparkExecutionConfig(self._decode_only_config(), vllm_config)
+
+    def test_invalid_enum_values_rejected(self):
+        with self.assertRaisesRegex(ValueError, "execution_phase"):
+            DSparkExecutionConfig({"execution_phase": "everywhere"}, self._make_vllm_config())
+        with self.assertRaisesRegex(ValueError, "staging_device"):
+            DSparkExecutionConfig({"staging_device": "cpu", **self._decode_only_config()}, self._make_vllm_config())
+        with self.assertRaisesRegex(ValueError, "overflow_policy"):
+            DSparkExecutionConfig(
+                {"overflow_policy": "reject", **self._decode_only_config()},
+                self._make_vllm_config(),
+            )
+
+    def test_non_positive_and_bool_limits_rejected(self):
+        base = self._make_vllm_config()
+        for bad_tokens in (0, -1, True, 4096.0, "4096"):
+            with self.assertRaisesRegex(ValueError, "positive int"):
+                DSparkExecutionConfig(self._decode_only_config(max_staged_tokens_per_request=bad_tokens), base)
+        for bad_bytes in (0, -128, True):
+            with self.assertRaisesRegex(ValueError, "positive int"):
+                DSparkExecutionConfig(self._decode_only_config(max_staged_bytes_total=bad_bytes), base)
+        with self.assertRaisesRegex(ValueError, "positive int"):
+            DSparkExecutionConfig(self._decode_only_config(lazy_init_chunk_tokens=0), base)
+
+    def test_non_dict_config_rejected(self):
+        with self.assertRaisesRegex(ValueError, "must be a dict"):
+            DSparkExecutionConfig("decode_only", self._make_vllm_config())
+
+    def test_decode_only_valid_config_passes(self):
+        cfg = DSparkExecutionConfig(
+            self._decode_only_config(
+                staging_device="npu", lazy_init_chunk_tokens=1024, overflow_policy="fallback_prefill_tail"
+            ),
+            self._make_vllm_config(),
+        )
+        self.assertTrue(cfg.decode_only)
+        self.assertEqual(cfg.max_staged_tokens_per_request, 32768)
+        self.assertEqual(cfg.max_staged_bytes_total, 2147483648)
+        self.assertEqual(cfg.lazy_init_chunk_tokens, 1024)
