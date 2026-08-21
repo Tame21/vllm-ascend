@@ -320,7 +320,22 @@ a2/（NPU 专用）与少量依赖真实设备的既有用例在沙箱无法收�
 | draft model 能力校验时机（§4.3 要求启动期） | 移至 `initialize_attn_backend`（load_model 之后） | proposer `__init__` 时 `self.model` 尚未加载 |
 | 配置校验位置（§4.3 在 AscendConfig 构造期） | 一致；proposer 侧额外兜底重解析 | 防御单例未初始化时 decode-only 被静默丢弃 |
 
-## 10. 已知限制（首版）
+## 10. 模型兼容性：Qwen3 系与 DeepSeek-V4-Flash
+
+两类 DSpark draft 模型的差异点与 decode-only 的处理：
+
+| 差异点 | Qwen3 DSpark | DeepSeek-V4-Flash DSpark | decode-only 处理 |
+| --- | --- | --- | --- |
+| target positions | xdrope/mrope：`[rope_dim, N]`（如 Qwen3.6 `[3, N]`） | MLA：1-D `[N]` | `_flatten_target_positions()` 取第一 rope 维；1-D 直接返回（no-op）。compact 沿 token 维（最后一维）索引，2-D 布局原样传给 `_propose` |
+| context slot 格式 | 1-D `block_id*bs + pos%bs` 直写 KV | 模型内部 `format_dsa_slot_mapping` 把 1-D 转为 `[block_idx, offset]` 后 `dsa_kv_compress_scatter` | lazy-init kernel 统一输出 1-D int32 slot（与现网 prefill_tail 的 first-pass kernel 相同），DSV4 模型侧自行格式化 |
+| 滑窗推导 | `SlidingWindowSpec` 或 full attention | `AscendSlidingWindowMLASpec`（继承 `sliding_window: int`） | 统一 `getattr(spec, "sliding_window")`：DSV4 全滑窗 → retained=max(window) 精确裁剪 |
+| draft fused buffer | `_num_attn_layers` 等元数据（`_build_fused_kv_buffers`） | 无该属性 | `_ensure_draft_fused_buffers` 对 DSV4 为 no-op；对 Qwen 校验/重建（见 §9 修复记录） |
+| `combine_hidden_states` | `fc(aux)` | `main_norm(main_proj(aux))` | 接口一致，直接调用 |
+| slot 列表顺序 | sorted(attn_layer_names) → `_layer_group_idx` | 同左；模型按 `layers.values()` 枚举消费 | 与现网 `_context_slot_mapping_buffers` 构造方式完全相同 |
+
+结论：DSV4 无需模型侧适配，decode-only 直接兼容；两类模型均已由 UT 锁定兼容点（mrope 摊平 / DSV4 SW-MLA spec 推导）。仍需在 DSV4 真机执行 §8.3 的 e2e parity 验证。
+
+## 11. 已知限制（首版）
 
 - 仅 Model Runner V1；V2 需按设计文档 §16 独立实现（启动即报错）；
 - 仅同步调度、prefix caching 关闭、无 PD/KV transfer、DCP=1；

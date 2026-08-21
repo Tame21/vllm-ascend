@@ -724,6 +724,40 @@ class TestDSparkDecodeOnlySlotRebuild(_DSparkDecodeOnlyTestBase):
         assert torch.equal(P._flatten_target_positions(flat), flat)
         mrope = torch.stack([torch.arange(7, dtype=torch.int32), torch.full((7,), 5), torch.zeros(7)])
         assert torch.equal(P._flatten_target_positions(mrope), mrope[0])
+
+    def test_init_decode_only_attn_state_dsv4_sw_mla_spec(self):
+        """DeepSeek-V4 DSpark draft layers use AscendSlidingWindowMLASpec
+        (sliding_window attr, no Qwen-style fused buffers). The retained
+        window must derive from the spec and the fused-buffer check must be
+        a no-op."""
+        proposer = self._make_decode_only_proposer()
+        # DSV4-style spec: sliding_window field, different block size.
+        proposer.draft_attn_groups = [
+            SimpleNamespace(
+                kv_cache_group_id=0,
+                kv_cache_spec=SimpleNamespace(block_size=128, sliding_window=8192),
+                layer_names=["L0"],
+            ),
+            SimpleNamespace(
+                kv_cache_group_id=1,
+                kv_cache_spec=SimpleNamespace(block_size=64, sliding_window=4096),
+                layer_names=["L1"],
+            ),
+        ]
+        proposer._layer_group_idx = [0, 1]
+        # DSV4 draft inner model has no _num_attn_layers; the check must
+        # silently pass without calling any builder.
+        draft_inner = MagicMock(spec=[])  # no attributes at all
+        proposer.model.model = draft_inner
+
+        proposer._init_decode_only_attn_state()
+
+        assert proposer._dspark_retained_context_tokens == 8192  # max(windows)
+        # Per-group lazy-init slot buffers allocated per spec block count.
+        assert set(proposer._lazy_init_slot_buffers) == {0, 1}
+        # Positions stay 1-D for MLA targets (no flatten side effect).
+        flat = torch.arange(5, dtype=torch.int32)
+        assert torch.equal(proposer._flatten_target_positions(flat), flat)
         from vllm_ascend.ops.triton.spec_decode.utils import build_dspark_context_slots
 
         # Empty subbatch must not launch any kernel.
