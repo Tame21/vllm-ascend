@@ -784,10 +784,11 @@ class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
             max_seq_len=32,
         )
 
-    def test_propose_compact_keeps_mrope_positions_layout(self):
-        """mrope/xdrope positions [3, N] must be compacted along the token
-        dim (last), not the rope dim, so set_inputs_first_pass can still
-        flatten them inside _propose."""
+    def test_propose_flattens_mrope_positions_before_propose(self):
+        """mrope/xdrope positions [3, N] must be flattened to 1-D (first rope
+        dim) before entering _propose: the DFlash/DSpark first-pass kernel
+        indexes positions by token and would otherwise interleave rope
+        coords into the context/query positions."""
         proposer = self._make_decode_only_proposer()
         self._make_pending_context(proposer, "r1", phase=DSparkRequestPhase.READY)
         # r0: prefill rows 0..1; r1: decode rows 2..4.
@@ -827,9 +828,9 @@ class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
             )
 
         sub_positions = captured["target_positions"]
-        assert sub_positions.shape == (3, 3)
-        # Token dim compacted: columns 2..4 of the original rope tensor.
-        assert torch.equal(sub_positions, rope[:, 2:5])
+        # Flattened to the first rope dim and compacted to r1's tokens.
+        assert sub_positions.dim() == 1
+        assert torch.equal(sub_positions, rope[0, 2:5])
         # Staged positions are flat 1-D from the first rope dim.
         ctx0 = proposer._pending_contexts["r0"]
         assert ctx0.chunks[0].positions.dim() == 1

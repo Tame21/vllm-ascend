@@ -875,10 +875,12 @@ class AscendDSparkProposer(AscendDflashProposer):
             req_ids, num_computed_tokens_cpu, num_prompt_tokens, num_scheduled_tokens
         )
         # mrope/xdrope targets hand positions as [rope_dim, num_tokens].
-        # Staging, lazy init and slot rebuild all work on flat 1-D token
-        # positions (first rope dim), matching the conversion inside
-        # AscendSpecDecodeBaseProposer.set_inputs_first_pass. The original
-        # 2-D tensor is still forwarded to _propose untouched.
+        # The DFlash/DSpark first-pass kernel indexes positions by token and
+        # has no 2-D layout support: a [3, N] tensor would interleave rope
+        # coords into the context/query positions (observed as ~2% draft
+        # acceptance and eventual device-side faults). Flatten to the first
+        # rope dim — the same row AscendSpecDecodeBaseProposer's EAGLE path
+        # feeds the draft — for staging, lazy init AND _propose.
         flat_positions = self._flatten_target_positions(target_positions)
 
         if any(meta.is_prefill):
@@ -907,7 +909,7 @@ class AscendDSparkProposer(AscendDflashProposer):
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
                 next_token_ids=next_token_ids,
                 target_token_ids=target_token_ids,
-                target_positions=target_positions,
+                target_positions=flat_positions,
                 raw_target_hidden_states=raw_target_hidden_states,
                 target_model_batch_desc=target_model_batch_desc,
                 sampling_metadata=sampling_metadata,
@@ -976,10 +978,10 @@ class AscendDSparkProposer(AscendDflashProposer):
         rows_gpu = torch.from_numpy(eligible_np).to(self.device, non_blocking=True)
 
         sub_token_ids = target_token_ids.index_select(0, compact_idx_long)
-        # mrope/xdrope positions arrive as [rope_dim, num_tokens]: compact
-        # along the token dim (last); set_inputs_first_pass flattens later.
-        positions_token_dim = -1 if target_positions.dim() > 1 else 0
-        sub_positions = target_positions.index_select(positions_token_dim, compact_idx_long)
+        # The caller flattens mrope/xdrope positions to 1-D before _propose
+        # (the first-pass kernel has no 2-D layout support); flatten again
+        # defensively so this helper is safe for any input layout.
+        sub_positions = self._flatten_target_positions(target_positions).index_select(0, compact_idx_long)
         sub_hidden = raw_target_hidden_states.index_select(0, compact_idx_long)
         sub_next = next_token_ids.index_select(0, rows_gpu)
         sub_rejected = (
