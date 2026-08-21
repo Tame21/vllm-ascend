@@ -302,6 +302,46 @@ class TestDSparkInitialization(_DSparkProposerTestBase):
         assert proposer.max_query_tokens == expected_max_query_tokens
 
 
+class TestDSparkFlattensMropePositionsInFirstPass(_DSparkProposerTestBase):
+    """Shared-path guard: mrope/xdrope targets hand positions as
+    [rope_dim, num_tokens]; the first-pass kernel indexes positions by
+    token and would interleave rope coords (observed as ~2% draft
+    acceptance on Qwen3.6). set_inputs_first_pass must flatten to the
+    first rope dim for BOTH prefill_tail and decode-only."""
+
+    def test_kernel_receives_flat_positions(self, monkeypatch):
+        kernel_mock = MagicMock()
+        monkeypatch.setattr(
+            "vllm_ascend.spec_decode.dspark_proposer.copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid",
+            kernel_mock,
+        )
+        num_reqs, block_size = 2, 4
+        proposer = self._make_proposer(max_num_tokens=64, num_reqs=num_reqs, block_size=block_size)
+        cad = SimpleNamespace(
+            num_reqs=num_reqs,
+            query_start_loc=torch.arange(num_reqs + 1, dtype=torch.int32) * block_size,
+            query_start_loc_cpu=torch.arange(num_reqs + 1, dtype=torch.int32) * block_size,
+            seq_lens=torch.full((num_reqs,), 128, dtype=torch.int32),
+            max_seq_len=128,
+        )
+        rope = torch.arange(3).unsqueeze(1) * 100 + torch.arange(num_reqs * block_size)  # [3, N]
+        proposer.set_inputs_first_pass(
+            target_token_ids=torch.zeros(num_reqs * block_size, dtype=torch.int64),
+            next_token_ids=torch.zeros(num_reqs, dtype=torch.int64),
+            target_positions=rope,
+            target_hidden_states=torch.zeros((num_reqs * block_size, 8), dtype=torch.float32),
+            token_indices_to_sample=None,
+            cad=cad,
+            num_rejected_tokens_gpu=None,
+        )
+        kernel_mock.__getitem__.assert_called_once_with((num_reqs,))
+        launch_mock = kernel_mock.__getitem__.return_value
+        launch_mock.assert_called_once()
+        positions_arg = launch_mock.call_args.kwargs["target_positions_ptr"]
+        assert positions_arg.dim() == 1
+        assert torch.equal(positions_arg, rope[0])
+
+
 class _DSparkDecodeOnlyTestBase(_DSparkProposerTestBase):
     """Shared helpers for DSpark decode-only state-machine tests."""
 

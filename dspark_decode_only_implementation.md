@@ -326,7 +326,7 @@ a2/（NPU 专用）与少量依赖真实设备的既有用例在沙箱无法收�
 
 | 差异点 | Qwen3 DSpark | DeepSeek-V4-Flash DSpark | decode-only 处理 |
 | --- | --- | --- | --- |
-| target positions | xdrope/mrope：`[rope_dim, N]`（如 Qwen3.6 `[3, N]`） | MLA：1-D `[N]` | `_flatten_target_positions()` 取第一 rope 维，**staging、lazy init、`_propose` 全路径统一摊平**——DFlash/DSpark first-pass kernel 按 token flat 索引 positions，不支持 2-D 布局（2-D 会把 rope 坐标交错进 context/query positions，表现为 acceptance ~2% 与设备级故障） |
+| target positions | xdrope/mrope：`[rope_dim, N]`（如 Qwen3.6 `[3, N]`） | MLA：1-D `[N]` | **共享路径与 decode-only 全路径均摊平**：`set_inputs_first_pass`（DFlash/DSpark override）入口与 decode-only 的 `_flatten_target_positions()` 都取第一 rope 维。NPU 实测确认：不摊平时 prefill_tail 基线 acceptance 也只有 ~2%（fork 共享路径缺陷，非 decode-only 引入），摊平是 EAGLE 默认路径的既有惯例（llm_base_proposer 的 `target_positions[0]`） |
 | context slot 格式 | 1-D `block_id*bs + pos%bs` 直写 KV | 模型内部 `format_dsa_slot_mapping` 把 1-D 转为 `[block_idx, offset]` 后 `dsa_kv_compress_scatter` | lazy-init kernel 统一输出 1-D int32 slot（与现网 prefill_tail 的 first-pass kernel 相同），DSV4 模型侧自行格式化 |
 | 滑窗推导 | `SlidingWindowSpec` 或 full attention | `AscendSlidingWindowMLASpec`（继承 `sliding_window: int`） | 统一 `getattr(spec, "sliding_window")`：DSV4 全滑窗 → retained=max(window) 精确裁剪 |
 | draft fused buffer | `_num_attn_layers` 等元数据（`_build_fused_kv_buffers`） | 无该属性 | `_ensure_draft_fused_buffers` 对 DSV4 为 no-op；对 Qwen 校验/重建（见 §9 修复记录） |

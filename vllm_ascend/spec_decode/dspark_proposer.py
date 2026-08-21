@@ -1248,7 +1248,14 @@ class AscendDSparkProposer(AscendDflashProposer):
         num_prefill_reqs=0,
         num_decode_reqs=0,
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata, tuple[Any, Any] | None]:
-        # The initial input token of markovHead is the next token
+        # The initial input token of markovHead is the next token.
+        # mrope/xdrope targets hand positions as [rope_dim, num_tokens];
+        # the first-pass kernel indexes positions by token, so flatten to
+        # the first rope dim (mirrors AscendDflashProposer and the EAGLE
+        # default path). Decode-only flattens earlier; this covers the
+        # prefill_tail path.
+        if target_positions.dim() > 1:
+            target_positions = target_positions[0]
         n = next_token_ids.shape[0]
         self._dspark_seed_buffer[:n].copy_(next_token_ids)
         self._dspark_seed_buffer[n:].fill_(0)

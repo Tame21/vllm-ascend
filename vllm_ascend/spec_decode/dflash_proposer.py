@@ -76,6 +76,13 @@ class AscendDflashProposer(AscendEagleProposer):
     ) -> tuple[int, torch.Tensor, CommonAttentionMetadata, tuple[Any, Any] | None]:
         # DFlash cross-attention: context K/V from target hidden states,
         # Q from query embeddings (bonus + mask tokens).
+        # mrope/xdrope targets hand positions as [rope_dim, num_tokens];
+        # the first-pass kernel indexes positions by token, so flatten to
+        # the first rope dim (the EAGLE default path does the same) or rope
+        # coords interleave into the context/query positions and drafts
+        # collapse to noise. Observed on Qwen3.6 (xdrope) as ~2% acceptance.
+        if target_positions.dim() > 1:
+            target_positions = target_positions[0]
         batch_size = cad.num_reqs
         num_context = target_token_ids.shape[0]
         num_query_per_req = 1 + self.num_speculative_tokens
