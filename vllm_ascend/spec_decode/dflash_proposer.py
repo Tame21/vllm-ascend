@@ -59,6 +59,11 @@ class AscendDflashProposer(AscendEagleProposer):
         )
 
         self.parallel_drafting_hidden_state_tensor = None
+        # Used by the input-expansion kernel to turn invalid block-table
+        # entries into padding slots instead of out-of-bounds KV addresses.
+        # DSpark replaces this conservative default with the configured
+        # logical block count during attention-backend initialization.
+        self.num_kv_cache_blocks = torch.iinfo(torch.int32).max
 
     def set_inputs_first_pass(
         self,
@@ -115,6 +120,7 @@ class AscendDflashProposer(AscendEagleProposer):
                 # Block table
                 block_table_ptr=cad.block_table_tensor,
                 block_table_stride=cad.block_table_tensor.stride(0),
+                num_kv_cache_blocks=self.num_kv_cache_blocks,
                 # Metadata
                 query_start_loc_ptr=cad.query_start_loc,
                 seq_lens_ptr=cad.seq_lens,

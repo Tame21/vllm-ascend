@@ -177,6 +177,11 @@ class AscendDSparkProposer(AscendDflashProposer):
 
         # per-layer context slot mappings as a flat list
         self._context_slot_mapping_buffers: list[torch.Tensor | None] | None = None
+        # Ascend may split a physical KV block into smaller logical/kernel
+        # blocks. Slot arithmetic must use the actual per-group kernel size,
+        # not KVCacheSpec.block_size.
+        self._per_group_kernel_block_sizes: dict[int, int] = {}
+        self._per_group_num_kv_cache_blocks: dict[int, int] = {}
 
         # ---------------- decode-only state ----------------
         self._init_decode_only_state()
@@ -767,13 +772,20 @@ class AscendDSparkProposer(AscendDflashProposer):
                 req_row_map=req_row_map_gpu,
                 req_start_loc=req_start_loc_gpu,
                 block_table=block_table,
-                block_size=int(attn_group.kv_cache_spec.block_size),
+                block_size=self._per_group_kernel_block_sizes.get(
+                    gid, int(attn_group.kv_cache_spec.block_size)
+                ),
+                num_kv_cache_blocks=self._per_group_num_kv_cache_blocks.get(
+                    gid, torch.iinfo(torch.int32).max
+                ),
                 out_slots=out_slots,
             )
             self._debug_validate_context_slots(
                 gid=gid,
                 block_table=block_table,
-                block_size=int(attn_group.kv_cache_spec.block_size),
+                block_size=self._per_group_kernel_block_sizes.get(
+                    gid, int(attn_group.kv_cache_spec.block_size)
+                ),
                 positions=positions,
                 req_row_map_cpu=req_row_map_cpu,
                 out_slots=out_slots,
@@ -1163,7 +1175,53 @@ class AscendDSparkProposer(AscendDflashProposer):
             )
 
         self.kv_cache_gid = self.draft_attn_groups[0].kv_cache_group_id
-        self.kernel_block_size = int(self.draft_attn_groups[0].kv_cache_spec.block_size)
+
+        # ModelRunner computes the authoritative per-group kernel block sizes
+        # before recreating its NPUInputBatch. Resolve from that list first;
+        # the argument is retained as a compatibility fallback for older
+        # callers, and the KV spec is the final fallback for unsplit blocks.
+        runner_kernel_block_sizes = getattr(self.runner, "kernel_block_sizes", None)
+
+        def resolve_kernel_block_size(gid: int, spec) -> int:
+            for sizes in (runner_kernel_block_sizes, kernel_block_sizes):
+                if sizes is None:
+                    continue
+                if isinstance(sizes, int):
+                    candidate = sizes if gid == 0 else 0
+                elif gid < len(sizes):
+                    candidate = sizes[gid]
+                else:
+                    continue
+                if isinstance(candidate, (list, tuple)):
+                    candidate = candidate[0] if candidate else 0
+                if isinstance(candidate, int) and candidate > 0:
+                    return int(candidate)
+            return int(spec.block_size)
+
+        configured_num_blocks = getattr(kv_cache_config, "num_blocks", None)
+        if configured_num_blocks is not None:
+            configured_num_blocks = int(configured_num_blocks)
+        for attn_group in self.draft_attn_groups:
+            gid = attn_group.kv_cache_group_id
+            spec_block_size = int(attn_group.kv_cache_spec.block_size)
+            kernel_block_size = resolve_kernel_block_size(gid, attn_group.kv_cache_spec)
+            if spec_block_size % kernel_block_size != 0:
+                raise RuntimeError(
+                    "DSpark draft KV block size must be divisible by the Ascend "
+                    f"kernel block size: gid={gid}, spec_block_size={spec_block_size}, "
+                    f"kernel_block_size={kernel_block_size}."
+                )
+            blocks_per_physical_block = spec_block_size // kernel_block_size
+            self._per_group_kernel_block_sizes[gid] = kernel_block_size
+            # BlockTable expands physical IDs into logical IDs when virtual
+            # kernel blocks are used, so include that expansion in the bound.
+            self._per_group_num_kv_cache_blocks[gid] = (
+                configured_num_blocks * blocks_per_physical_block
+                if configured_num_blocks is not None
+                else torch.iinfo(torch.int32).max
+            )
+
+        self.kernel_block_size = self._per_group_kernel_block_sizes[self.kv_cache_gid]
 
         name_to_gid = {
             ln: gid
@@ -1287,7 +1345,9 @@ class AscendDSparkProposer(AscendDflashProposer):
             gid_block_table = self._per_group_block_table_buffers.get(gid)
             if gid_block_table is None:
                 continue
-            kv_block_size = int(attn_group.kv_cache_spec.block_size)
+            kv_block_size = self._per_group_kernel_block_sizes.get(
+                gid, int(attn_group.kv_cache_spec.block_size)
+            )
             if batch_size > 0:
                 copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid[batch_size,](
                     # Inputs
@@ -1304,6 +1364,9 @@ class AscendDSparkProposer(AscendDflashProposer):
                     # Block table
                     block_table_ptr=gid_block_table,
                     block_table_stride=gid_block_table.stride(0),
+                    num_kv_cache_blocks=self._per_group_num_kv_cache_blocks.get(
+                        gid, torch.iinfo(torch.int32).max
+                    ),
                     # Metadata
                     query_start_loc_ptr=cad.query_start_loc,
                     seq_lens_ptr=cad.seq_lens,

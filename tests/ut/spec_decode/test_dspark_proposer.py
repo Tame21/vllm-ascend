@@ -341,6 +341,38 @@ class TestDSparkFlattensMropePositionsInFirstPass(_DSparkProposerTestBase):
         assert positions_arg.dim() == 1
         assert torch.equal(positions_arg, rope[0])
 
+    def test_kernel_receives_logical_block_metadata(self, monkeypatch):
+        """Hybrid KV caches must use logical block size and count in the kernel."""
+        kernel_mock = MagicMock()
+        monkeypatch.setattr(
+            "vllm_ascend.spec_decode.dspark_proposer.copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid",
+            kernel_mock,
+        )
+        proposer = self._make_proposer(max_num_tokens=64, num_reqs=1, block_size=8)
+        proposer._per_group_kernel_block_sizes = {0: 2}
+        proposer._per_group_num_kv_cache_blocks = {0: 40}
+        cad = SimpleNamespace(
+            num_reqs=1,
+            query_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 1], dtype=torch.int32),
+            seq_lens=torch.tensor([128], dtype=torch.int32),
+            max_seq_len=128,
+        )
+
+        proposer.set_inputs_first_pass(
+            target_token_ids=torch.zeros(1, dtype=torch.int64),
+            next_token_ids=torch.zeros(1, dtype=torch.int64),
+            target_positions=torch.zeros(1, dtype=torch.int32),
+            target_hidden_states=torch.zeros((1, 8), dtype=torch.float32),
+            token_indices_to_sample=None,
+            cad=cad,
+            num_rejected_tokens_gpu=None,
+        )
+
+        launch_kwargs = kernel_mock.__getitem__.return_value.call_args.kwargs
+        assert launch_kwargs["block_size"] == 2
+        assert launch_kwargs["num_kv_cache_blocks"] == 40
+
 
 class _DSparkDecodeOnlyTestBase(_DSparkProposerTestBase):
     """Shared helpers for DSpark decode-only state-machine tests."""
@@ -756,6 +788,25 @@ class TestDSparkDecodeOnlySlotRebuild(_DSparkDecodeOnlyTestBase):
             block_size=16,
             out_slots=torch.zeros(0, dtype=torch.int32),
         )
+
+    def test_build_dspark_context_slots_passes_logical_block_bound(self, monkeypatch):
+        import vllm_ascend.ops.triton.spec_decode.utils as spec_decode_utils
+        from vllm_ascend.ops.triton.spec_decode.utils import build_dspark_context_slots
+
+        kernel_mock = MagicMock()
+        monkeypatch.setattr(spec_decode_utils, "build_dspark_context_slots_kernel", kernel_mock)
+        build_dspark_context_slots(
+            positions=torch.tensor([7], dtype=torch.int32),
+            req_row_map=torch.tensor([0], dtype=torch.int32),
+            req_start_loc=torch.tensor([0, 1], dtype=torch.int32),
+            block_table=torch.zeros(1, 8, dtype=torch.int32),
+            block_size=2,
+            out_slots=torch.zeros(1, dtype=torch.int32),
+            num_kv_cache_blocks=40,
+        )
+
+        launch_kwargs = kernel_mock.__getitem__.return_value.call_args.kwargs
+        assert launch_kwargs["num_kv_cache_blocks"] == 40
 
     def test_flatten_target_positions(self):
         from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer as P

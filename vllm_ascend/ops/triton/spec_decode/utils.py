@@ -82,6 +82,7 @@ def copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid(
     # Block table
     block_table_ptr,  # [max_reqs, max_blocks]
     block_table_stride,  # stride of block_table dim 0 (in elements)
+    num_kv_cache_blocks,  # maximum logical block id (exclusive)
     # Metadata
     query_start_loc_ptr,  # [num_reqs + 1]
     seq_lens_ptr,  # [num_reqs]
@@ -128,8 +129,18 @@ def copy_and_expand_dflash_and_dspark_inputs_kernel_single_grid(
 
         query_cache_pos = effective_seq_len + q_idx
         block_num_q = query_cache_pos // block_size
-        block_id_q = tl.load(block_table_ptr + req_idx * block_table_stride + block_num_q).to(tl.int64)
-        slot_q = block_id_q * block_size + (query_cache_pos % block_size)
+        valid_block_num = (block_num_q >= 0) & (block_num_q < block_table_stride)
+        block_id_q = tl.load(
+            block_table_ptr + req_idx * block_table_stride + block_num_q,
+            mask=valid_block_num,
+            other=-1,
+        ).to(tl.int64)
+        valid_block_id = valid_block_num & (block_id_q >= 0) & (block_id_q < num_kv_cache_blocks)
+        slot_q = tl.where(
+            valid_block_id,
+            block_id_q * block_size + (query_cache_pos % block_size),
+            -1,
+        )
         tl.store(out_query_slot_mapping_ptr + query_out_idx, slot_q)
 
         if q_idx == 0:
@@ -154,6 +165,7 @@ def build_dspark_context_slots_kernel(
     req_start_loc_ptr,  # [num_reqs + 1] per-request token start in the flat array
     block_table_ptr,  # [max_reqs, max_blocks] full-batch block table (one per group)
     block_table_stride,  # stride of block_table dim 0 (in elements)
+    num_kv_cache_blocks,  # maximum logical block id (exclusive)
     out_slots_ptr,  # [num_context_tokens] output slots for this group
     block_size,  # tl.int32, KV group block size
     num_reqs,  # tl.int32
@@ -172,8 +184,18 @@ def build_dspark_context_slots_kernel(
     for i in range(token_start, token_end):
         pos = tl.load(positions_ptr + i)
         block_num = pos // block_size
-        block_id = tl.load(block_table_ptr + full_row * block_table_stride + block_num).to(tl.int64)
-        slot = block_id * block_size + (pos % block_size)
+        valid_block_num = (block_num >= 0) & (block_num < block_table_stride)
+        block_id = tl.load(
+            block_table_ptr + full_row * block_table_stride + block_num,
+            mask=valid_block_num,
+            other=-1,
+        ).to(tl.int64)
+        valid_block_id = valid_block_num & (block_id >= 0) & (block_id < num_kv_cache_blocks)
+        slot = tl.where(
+            valid_block_id,
+            block_id * block_size + (pos % block_size),
+            -1,
+        )
         tl.store(out_slots_ptr + i, slot)
 
 
@@ -184,6 +206,7 @@ def build_dspark_context_slots(
     block_table: "torch.Tensor",
     block_size: int,
     out_slots: "torch.Tensor",
+    num_kv_cache_blocks: int | None = None,
 ) -> None:
     """Batch-rebuild per-group DSpark context slots on device.
 
@@ -194,16 +217,21 @@ def build_dspark_context_slots(
         block_table: current full-batch block table of one draft KV group.
         block_size: block size of that draft KV group.
         out_slots: output slot buffer [num_context_tokens], int32/int64.
+        num_kv_cache_blocks: maximum logical block id (exclusive). If omitted,
+            only block-table bounds and negative block IDs are guarded.
     """
     num_reqs = req_row_map.shape[0]
     if num_reqs == 0:
         return
+    if num_kv_cache_blocks is None:
+        num_kv_cache_blocks = torch.iinfo(torch.int32).max
     build_dspark_context_slots_kernel[num_reqs,](
         positions_ptr=positions,
         req_row_map_ptr=req_row_map.to(torch.int32),
         req_start_loc_ptr=req_start_loc.to(torch.int32),
         block_table_ptr=block_table,
         block_table_stride=block_table.stride(0),
+        num_kv_cache_blocks=num_kv_cache_blocks,
         out_slots_ptr=out_slots,
         block_size=block_size,
         num_reqs=num_reqs,
