@@ -681,6 +681,30 @@ class AscendDSparkProposer(AscendDflashProposer):
                     remaining -= take
         flush()
 
+    def _ensure_draft_fused_buffers(self) -> None:
+        """Ensure the draft model's fused context-KV buffer metadata is valid.
+
+        The fused-projection buffers (``_num_attn_layers`` etc.) are normally
+        built during weight loading or on the first prefill-side
+        ``precompute_and_store_context_kv`` call. Decode-only defers that
+        first call to lazy init, so a missing or invalid (e.g. -1 sentinel)
+        value must be rebuilt here instead of crashing inside the projection.
+        """
+        draft_inner = getattr(self.model, "model", None)
+        if draft_inner is None:
+            return
+        num_attn_layers = getattr(draft_inner, "_num_attn_layers", None)
+        if num_attn_layers is not None and num_attn_layers > 0:
+            return
+        builder = getattr(draft_inner, "_build_fused_kv_buffers", None)
+        if callable(builder):
+            logger.info(
+                "[dspark/decode_only] draft fused context-KV buffers missing "
+                "or invalid (_num_attn_layers=%r); rebuilding now.",
+                num_attn_layers,
+            )
+            builder()
+
     def _project_context_kv(
         self,
         raw_hidden: torch.Tensor,
@@ -692,7 +716,27 @@ class AscendDSparkProposer(AscendDflashProposer):
         num_tokens = raw_hidden.shape[0]
         if num_tokens == 0:
             return
+        self._ensure_draft_fused_buffers()
         combined = self.model.combine_hidden_states(raw_hidden)
+        if combined.shape[0] != positions.shape[0]:
+            raise RuntimeError(
+                "[dspark/decode_only] lazy-init pack shape mismatch: "
+                "combined hidden rows={} vs positions rows={} "
+                "(raw_hidden.shape={}, positions.shape={})".format(
+                    combined.shape[0],
+                    positions.shape[0],
+                    tuple(raw_hidden.shape),
+                    tuple(positions.shape),
+                )
+            )
+        draft_inner = getattr(self.model, "model", None)
+        num_attn_layers = getattr(draft_inner, "_num_attn_layers", None)
+        if num_attn_layers is not None and num_attn_layers <= 0:
+            raise RuntimeError(
+                "[dspark/decode_only] draft fused context-KV buffers are "
+                "invalid (_num_attn_layers={}, num_ctx={}): the draft model "
+                "reports no attention layers; refusing to project context KV.".format(num_attn_layers, num_tokens)
+            )
         req_start_loc_gpu = req_start_loc_cpu.to(self.device, non_blocking=True)
         req_row_map_gpu = req_row_map_cpu.to(self.device, non_blocking=True)
         per_group_slots: dict[int, torch.Tensor] = {}
@@ -1046,6 +1090,10 @@ class AscendDSparkProposer(AscendDflashProposer):
                     "DSpark decode_only requires the draft model to expose "
                     f"`{method_name}()`; the loaded draft model does not."
                 )
+        # Validate (and rebuild) the fused context-KV buffers now: decode-only
+        # defers the first precompute call to lazy init, so an invalid value
+        # must surface at startup rather than mid-serving.
+        self._ensure_draft_fused_buffers()
         _, _, chunk_tokens = self._decode_only_limits()
         windows: list[int] = []
         has_full_attention = False

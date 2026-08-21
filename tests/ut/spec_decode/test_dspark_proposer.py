@@ -632,12 +632,62 @@ class TestDSparkDecodeOnlyLifecycle(_DSparkDecodeOnlyTestBase):
 class TestDSparkDecodeOnlySlotRebuild(_DSparkDecodeOnlyTestBase):
     def test_project_context_kv_requires_current_block_table(self):
         proposer = self._make_decode_only_proposer()
+        proposer.model.combine_hidden_states = lambda h: h
+        proposer.model.model = SimpleNamespace(_num_attn_layers=4)
         proposer._lazy_init_slot_buffers = {0: torch.zeros(16, dtype=torch.int32)}
         proposer._per_group_block_tables = {}  # runner metadata missing
         with pytest.raises(RuntimeError, match="block table"):
             proposer._project_context_kv(
                 torch.randn(4, 8),
                 torch.arange(4, dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0, 4], dtype=torch.int32),
+            )
+
+    def test_ensure_draft_fused_buffers_rebuilds_invalid_sentinel(self):
+        proposer = self._make_decode_only_proposer()
+        draft_inner = MagicMock()
+        draft_inner._num_attn_layers = -1  # invalid sentinel left by a partial build
+        proposer.model.model = draft_inner
+
+        proposer._ensure_draft_fused_buffers()
+
+        draft_inner._build_fused_kv_buffers.assert_called_once()
+
+    def test_ensure_draft_fused_buffers_skips_when_valid(self):
+        proposer = self._make_decode_only_proposer()
+        draft_inner = MagicMock()
+        draft_inner._num_attn_layers = 4
+        proposer.model.model = draft_inner
+
+        proposer._ensure_draft_fused_buffers()
+
+        draft_inner._build_fused_kv_buffers.assert_not_called()
+
+    def test_project_context_kv_rejects_invalid_num_attn_layers(self):
+        proposer = self._make_decode_only_proposer()
+        proposer.model.combine_hidden_states = lambda h: h
+        draft_inner = SimpleNamespace(_num_attn_layers=-1)
+        draft_inner._build_fused_kv_buffers = MagicMock()
+        proposer.model.model = draft_inner
+        proposer._per_group_block_tables = {}  # unreachable: assert fires first
+
+        with pytest.raises(RuntimeError, match="_num_attn_layers"):
+            proposer._project_context_kv(
+                torch.randn(2, 8),
+                torch.arange(2, dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0, 2], dtype=torch.int32),
+            )
+
+    def test_project_context_kv_rejects_shape_mismatch(self):
+        proposer = self._make_decode_only_proposer()
+        proposer.model.combine_hidden_states = lambda h: h
+        proposer.model.model = SimpleNamespace(_num_attn_layers=4)
+        with pytest.raises(RuntimeError, match="shape mismatch"):
+            proposer._project_context_kv(
+                torch.randn(4, 8),
+                torch.arange(3, dtype=torch.int32),  # 3 positions vs 4 hidden rows
                 torch.tensor([0], dtype=torch.int32),
                 torch.tensor([0, 4], dtype=torch.int32),
             )

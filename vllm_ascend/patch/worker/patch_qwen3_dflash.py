@@ -12,11 +12,26 @@ def precompute_and_store_context_kv(
     context_positions: torch.Tensor,
     context_slot_mapping: torch.Tensor | None = None,
 ) -> None:
-    if not hasattr(self, "_num_attn_layers"):
+    # Rebuild when the metadata is missing OR invalid (e.g. left at a -1
+    # sentinel by a partially initialized build). hasattr alone cannot
+    # detect a stale sentinel, and DSpark decode-only defers the first
+    # call to lazy init, surfacing the invalid value much later.
+    if getattr(self, "_num_attn_layers", 0) <= 0:
         self._build_fused_kv_buffers()
 
     num_ctx = context_states.shape[0]
     L = self._num_attn_layers
+    if L <= 0:
+        raise RuntimeError(
+            "DFlash/DSpark fused context-KV buffers are invalid after "
+            "(re)build: _num_attn_layers={}, num_ctx={}, positions.shape={}, "
+            "model={}. The draft model has no populated attention layers.".format(
+                L,
+                num_ctx,
+                tuple(context_positions.shape),
+                type(self).__name__,
+            )
+        )
     kv = self._kv_size
     hd = self._head_dim
     nkv = self._num_kv_heads
