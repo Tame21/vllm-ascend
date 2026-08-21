@@ -680,6 +680,18 @@ class TestDSparkDecodeOnlySlotRebuild(_DSparkDecodeOnlyTestBase):
                 torch.tensor([0, 2], dtype=torch.int32),
             )
 
+    def test_project_context_kv_rejects_2d_positions(self):
+        proposer = self._make_decode_only_proposer()
+        proposer.model.combine_hidden_states = lambda h: h
+        proposer.model.model = SimpleNamespace(_num_attn_layers=4)
+        with pytest.raises(RuntimeError, match="1-D token positions"):
+            proposer._project_context_kv(
+                torch.randn(4, 8),
+                torch.zeros(3, 4, dtype=torch.int32),
+                torch.tensor([0], dtype=torch.int32),
+                torch.tensor([0, 4], dtype=torch.int32),
+            )
+
     def test_project_context_kv_rejects_shape_mismatch(self):
         proposer = self._make_decode_only_proposer()
         proposer.model.combine_hidden_states = lambda h: h
@@ -705,6 +717,25 @@ class TestDSparkDecodeOnlySlotRebuild(_DSparkDecodeOnlyTestBase):
             out_slots=torch.zeros(0, dtype=torch.int32),
         )
 
+    def test_flatten_target_positions(self):
+        from vllm_ascend.spec_decode.dspark_proposer import AscendDSparkProposer as P
+
+        flat = torch.arange(7, dtype=torch.int32)
+        assert torch.equal(P._flatten_target_positions(flat), flat)
+        mrope = torch.stack([torch.arange(7, dtype=torch.int32), torch.full((7,), 5), torch.zeros(7)])
+        assert torch.equal(P._flatten_target_positions(mrope), mrope[0])
+        from vllm_ascend.ops.triton.spec_decode.utils import build_dspark_context_slots
+
+        # Empty subbatch must not launch any kernel.
+        build_dspark_context_slots(
+            positions=torch.zeros(0, dtype=torch.int32),
+            req_row_map=torch.zeros(0, dtype=torch.int32),
+            req_start_loc=torch.tensor([0], dtype=torch.int32),
+            block_table=torch.zeros(2, 8, dtype=torch.int32),
+            block_size=16,
+            out_slots=torch.zeros(0, dtype=torch.int32),
+        )
+
 
 class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
     def _make_cad(self, num_reqs: int, qsl: list[int]) -> SimpleNamespace:
@@ -718,6 +749,56 @@ class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
             positions=torch.zeros(64, dtype=torch.int32),
             max_seq_len=32,
         )
+
+    def test_propose_compact_keeps_mrope_positions_layout(self):
+        """mrope/xdrope positions [3, N] must be compacted along the token
+        dim (last), not the rope dim, so set_inputs_first_pass can still
+        flatten them inside _propose."""
+        proposer = self._make_decode_only_proposer()
+        self._make_pending_context(proposer, "r1", phase=DSparkRequestPhase.READY)
+        # r0: prefill rows 0..1; r1: decode rows 2..4.
+        num_computed = np.array([4, 20], dtype=np.int64)
+        prompt_lens = np.array([12, 12], dtype=np.int64)
+        scheduled = {"r0": 2, "r1": 3}
+        cad = self._make_cad(2, [0, 2, 5])
+        rope = torch.arange(3).unsqueeze(1) * 100 + torch.arange(5)  # [3, 5]
+        k = proposer.num_speculative_tokens
+        captured = {}
+
+        def fake_propose(**kwargs):
+            captured.update(kwargs)
+            # Only r1 (one decode row) is eligible here.
+            return torch.ones(1, k, dtype=torch.int64)
+
+        with (
+            patch.object(proposer, "_propose", side_effect=fake_propose),
+            patch.object(proposer, "_project_staged_contexts"),
+        ):
+            proposer.propose_decode_only(
+                scheduler_output=SimpleNamespace(num_scheduled_tokens=scheduled),
+                common_attn_metadata=cad,
+                token_indices=None,
+                token_indices_to_sample=None,
+                num_rejected_tokens_gpu=None,
+                next_token_ids=torch.arange(2, dtype=torch.int64),
+                target_token_ids=torch.arange(5, dtype=torch.int64),
+                target_positions=rope.clone(),
+                raw_target_hidden_states=torch.randn(5, 8),
+                num_scheduled_tokens=scheduled,
+                req_ids=["r0", "r1"],
+                num_computed_tokens_cpu=num_computed,
+                num_prompt_tokens=prompt_lens,
+                target_model_batch_desc=SimpleNamespace(uniform=False),
+                sampling_metadata=None,
+            )
+
+        sub_positions = captured["target_positions"]
+        assert sub_positions.shape == (3, 3)
+        # Token dim compacted: columns 2..4 of the original rope tensor.
+        assert torch.equal(sub_positions, rope[:, 2:5])
+        # Staged positions are flat 1-D from the first rope dim.
+        ctx0 = proposer._pending_contexts["r0"]
+        assert ctx0.chunks[0].positions.dim() == 1
 
     def test_prefill_only_step_publishes_empty_mask_without_proposal(self):
         proposer = self._make_decode_only_proposer()

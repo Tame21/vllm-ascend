@@ -717,6 +717,12 @@ class AscendDSparkProposer(AscendDflashProposer):
         if num_tokens == 0:
             return
         self._ensure_draft_fused_buffers()
+        if positions.dim() != 1:
+            raise RuntimeError(
+                "[dspark/decode_only] lazy-init expects flat 1-D token "
+                "positions, got shape {} (mrope/xdrope layout leaked into "
+                "staging); this is a proposer bug.".format(tuple(positions.shape))
+            )
         combined = self.model.combine_hidden_states(raw_hidden)
         if combined.shape[0] != positions.shape[0]:
             raise RuntimeError(
@@ -831,6 +837,19 @@ class AscendDSparkProposer(AscendDflashProposer):
                 sampling_metadata=sampling_metadata,
             )
 
+    @staticmethod
+    def _flatten_target_positions(target_positions: torch.Tensor) -> torch.Tensor:
+        """Flatten [rope_dim, num_tokens] (mrope/xdrope) positions to 1-D.
+
+        DSpark context staging / lazy init / slot rebuild index positions by
+        token; for 2-D layouts the first rope dim is the token position, the
+        same row AscendSpecDecodeBaseProposer.set_inputs_first_pass feeds to
+        the draft model.
+        """
+        if target_positions.dim() > 1:
+            return target_positions[0]
+        return target_positions
+
     def _propose_decode_only_impl(
         self,
         *,
@@ -855,13 +874,19 @@ class AscendDSparkProposer(AscendDflashProposer):
         meta = self.classify_decode_only_requests(
             req_ids, num_computed_tokens_cpu, num_prompt_tokens, num_scheduled_tokens
         )
+        # mrope/xdrope targets hand positions as [rope_dim, num_tokens].
+        # Staging, lazy init and slot rebuild all work on flat 1-D token
+        # positions (first rope dim), matching the conversion inside
+        # AscendSpecDecodeBaseProposer.set_inputs_first_pass. The original
+        # 2-D tensor is still forwarded to _propose untouched.
+        flat_positions = self._flatten_target_positions(target_positions)
 
         if any(meta.is_prefill):
             with record_function_or_nullcontext("dspark_stage_context"):
                 self.stage_prefill_context(
                     meta,
                     raw_target_hidden_states,
-                    target_positions,
+                    flat_positions,
                     common_attn_metadata.query_start_loc_cpu,
                 )
 
@@ -951,7 +976,10 @@ class AscendDSparkProposer(AscendDflashProposer):
         rows_gpu = torch.from_numpy(eligible_np).to(self.device, non_blocking=True)
 
         sub_token_ids = target_token_ids.index_select(0, compact_idx_long)
-        sub_positions = target_positions.index_select(0, compact_idx_long)
+        # mrope/xdrope positions arrive as [rope_dim, num_tokens]: compact
+        # along the token dim (last); set_inputs_first_pass flattens later.
+        positions_token_dim = -1 if target_positions.dim() > 1 else 0
+        sub_positions = target_positions.index_select(positions_token_dim, compact_idx_long)
         sub_hidden = raw_target_hidden_states.index_select(0, compact_idx_long)
         sub_next = next_token_ids.index_select(0, rows_gpu)
         sub_rejected = (
