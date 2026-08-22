@@ -2276,7 +2276,19 @@ class NPUModelRunner(GPUModelRunner):
                 sample_hidden_states,
                 batch_desc,
             )
-            self._copy_draft_token_ids_to_cpu(scheduler_output)
+            if self._draft_token_ids is None and self._is_dspark_decode_only():
+                # DSpark decode-only pure-prefill steps intentionally return
+                # no draft tensor: publish the target sampled token without
+                # copying placeholder draft IDs or waiting on the draft-token
+                # event.
+                self._draft_token_req_ids = None
+                self._draft_token_valid_mask_cpu = None
+                logger.info_once(
+                    "[dspark/decode_only] ModelRunner is skipping draft-token "
+                    "copy/sync on prefill-only steps"
+                )
+            else:
+                self._copy_draft_token_ids_to_cpu(scheduler_output)
 
         output_spec_token_ids = None
         use_padded_batch = False

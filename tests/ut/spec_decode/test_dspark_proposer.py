@@ -951,7 +951,7 @@ class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
                 sampling_metadata=None,
             )
         mock_propose.assert_not_called()
-        assert drafts.shape == (2, proposer.num_speculative_tokens)
+        assert drafts is None
         assert proposer.take_last_draft_valid_mask() == [False, False]
         assert proposer._pending_contexts["r1"].phase == DSparkRequestPhase.PENDING_INIT
 

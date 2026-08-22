@@ -906,7 +906,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         num_prompt_tokens,
         target_model_batch_desc,
         sampling_metadata,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         """DSpark decode-only orchestration: stage, lazy-init, propose, scatter."""
         with record_function_or_nullcontext("dspark_decode_proposal"):
             return self._propose_decode_only_impl(
@@ -958,7 +958,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         num_prompt_tokens,
         target_model_batch_desc,
         sampling_metadata,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | None:
         del token_indices  # target tensors are already gathered by the runner.
         num_reqs = len(req_ids)
         meta = self.classify_decode_only_requests(
@@ -988,31 +988,62 @@ class AscendDSparkProposer(AscendDflashProposer):
                 self.initialize_pending_contexts([req_ids[row] for row in pending_rows], pending_rows)
 
         eligible_rows = sorted(pending_rows + ready_rows + fallback_final_rows)
-        full_drafts = torch.zeros((num_reqs, self.num_speculative_tokens), dtype=torch.int64, device=self.device)
         valid_mask = [False] * num_reqs
 
-        if eligible_rows:
-            sub_drafts = self._propose_compact(
-                eligible_rows=eligible_rows,
-                common_attn_metadata=common_attn_metadata,
-                token_indices_to_sample=token_indices_to_sample,
-                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
-                next_token_ids=next_token_ids,
-                target_token_ids=target_token_ids,
-                target_positions=flat_positions,
-                raw_target_hidden_states=raw_target_hidden_states,
-                target_model_batch_desc=target_model_batch_desc,
-                sampling_metadata=sampling_metadata,
-                scheduler_output=scheduler_output,
+        if not eligible_rows:
+            # Pure prefill: raw auxiliary hidden states have been staged, but
+            # no request is eligible for a draft proposal yet. Returning None
+            # lets ModelRunner skip the draft-token D2H/event path entirely;
+            # the target sampled token can be returned immediately. A
+            # fallback final-prefill row is included in eligible_rows above,
+            # so fallback_prefill_tail keeps its historical proposal behavior.
+            self._last_draft_valid_mask = valid_mask
+            logger.info_once(
+                "[dspark/decode_only] prefill-only path active: DSpark proposal "
+                "is skipped before the first decode"
             )
-            if len(eligible_rows) == num_reqs:
-                full_drafts = sub_drafts
-            else:
-                rows_gpu = torch.tensor(eligible_rows, dtype=torch.int64, device=self.device)
-                full_drafts.index_copy_(0, rows_gpu, sub_drafts)
-            for row in eligible_rows:
-                valid_mask[row] = True
-            self._mark_rows_proposed(meta, pending_rows, fallback_final_rows)
+            logger.debug(
+                "[dspark/decode_only] prefill-only step: skipped DSpark proposal "
+                "(num_reqs=%d, scheduled_tokens=%d)",
+                num_reqs,
+                sum(num_scheduled_tokens.values()),
+            )
+            return None
+
+        full_drafts = torch.zeros((num_reqs, self.num_speculative_tokens), dtype=torch.int64, device=self.device)
+        prefill_rows = sum(meta.is_prefill)
+        if prefill_rows:
+            logger.info_once(
+                "[dspark/decode_only] mixed-batch path active: DSpark proposal "
+                "is limited to decode-eligible rows"
+            )
+            logger.debug(
+                "[dspark/decode_only] mixed batch: skipped DSpark proposal "
+                "for prefill rows (prefill_rows=%d, proposal_rows=%d)",
+                prefill_rows,
+                len(eligible_rows),
+            )
+        sub_drafts = self._propose_compact(
+            eligible_rows=eligible_rows,
+            common_attn_metadata=common_attn_metadata,
+            token_indices_to_sample=token_indices_to_sample,
+            num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+            next_token_ids=next_token_ids,
+            target_token_ids=target_token_ids,
+            target_positions=flat_positions,
+            raw_target_hidden_states=raw_target_hidden_states,
+            target_model_batch_desc=target_model_batch_desc,
+            sampling_metadata=sampling_metadata,
+            scheduler_output=scheduler_output,
+        )
+        if len(eligible_rows) == num_reqs:
+            full_drafts = sub_drafts
+        else:
+            rows_gpu = torch.tensor(eligible_rows, dtype=torch.int64, device=self.device)
+            full_drafts.index_copy_(0, rows_gpu, sub_drafts)
+        for row in eligible_rows:
+            valid_mask[row] = True
+        self._mark_rows_proposed(meta, pending_rows, fallback_final_rows)
 
         self._last_draft_valid_mask = valid_mask
         return full_drafts
