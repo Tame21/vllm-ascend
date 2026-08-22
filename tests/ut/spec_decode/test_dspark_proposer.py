@@ -550,16 +550,62 @@ class TestDSparkDecodeOnlyStaging(_DSparkDecodeOnlyTestBase):
         )
         assert proposer._pending_contexts["r0"].phase == DSparkRequestPhase.PENDING_INIT
 
-    def test_sliding_window_trims_to_last_n_positions(self):
+    def test_sliding_window_stages_only_suffix(self):
         proposer = self._make_decode_only_proposer()
         proposer._dspark_retained_context_tokens = 4
-        meta = self._make_meta(["r0"], is_prefill=[True], prompt_lens=[10])
-        positions = torch.arange(6, dtype=torch.int32)
+        meta = self._make_meta(
+            ["r0"],
+            is_prefill=[True],
+            finishes_prefill=[True],
+            prompt_lens=[10],
+        )
+        meta.num_computed_tokens = [4]
+        positions = torch.arange(4, 10, dtype=torch.int32)
         proposer.stage_prefill_context(meta, torch.randn(6, 8), positions, torch.tensor([0, 6], dtype=torch.int32))
         ctx = proposer._pending_contexts["r0"]
         assert ctx.num_staged_tokens == 4
-        assert ctx.chunks[0].positions.tolist() == [2, 3, 4, 5]
+        assert ctx.chunks[0].positions.tolist() == [6, 7, 8, 9]
         assert ctx.num_staged_bytes == 4 * (8 * 4 + 4)
+
+    def test_sliding_window_skips_early_chunks_before_materializing(self):
+        proposer = self._make_decode_only_proposer()
+        proposer._dspark_retained_context_tokens = 4
+        early_meta = self._make_meta(
+            ["r0"],
+            is_prefill=[True],
+            prompt_lens=[10],
+        )
+        aux0 = torch.randn(6, 3)
+        aux1 = torch.randn(6, 5)
+        proposer.stage_prefill_context(
+            early_meta,
+            raw_target_hidden_states=None,
+            target_positions=torch.arange(6, dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 6], dtype=torch.int32),
+            raw_aux_hidden_states=[aux0, aux1],
+        )
+        assert proposer._pending_contexts["r0"].num_staged_tokens == 0
+
+        final_meta = self._make_meta(
+            ["r0"],
+            is_prefill=[True],
+            finishes_prefill=[True],
+            prompt_lens=[10],
+        )
+        final_meta.num_computed_tokens = [6]
+        final0 = torch.randn(4, 3)
+        final1 = torch.randn(4, 5)
+        proposer.stage_prefill_context(
+            final_meta,
+            raw_target_hidden_states=None,
+            target_positions=torch.arange(6, 10, dtype=torch.int32),
+            query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.int32),
+            raw_aux_hidden_states=[final0, final1],
+        )
+        ctx = proposer._pending_contexts["r0"]
+        assert ctx.num_staged_tokens == 4
+        assert ctx.chunks[0].raw_hidden_states.shape == (4, 8)
+        assert ctx.chunks[0].positions.tolist() == [6, 7, 8, 9]
 
     def test_full_attention_keeps_entire_prompt(self):
         proposer = self._make_decode_only_proposer()

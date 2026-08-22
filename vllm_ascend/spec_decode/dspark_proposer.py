@@ -90,6 +90,7 @@ class DSparkDecodeOnlyRequestMeta:
     is_prefill: list[bool]
     finishes_prefill: list[bool]
     prompt_lens: list[int]
+    num_computed_tokens: list[int] = field(default_factory=list)
 
 
 class AscendDSparkProposer(AscendDflashProposer):
@@ -342,6 +343,7 @@ class AscendDSparkProposer(AscendDflashProposer):
         is_prefill: list[bool] = []
         finishes_prefill: list[bool] = []
         prompt_lens: list[int] = []
+        num_computed_tokens: list[int] = []
         for row in range(num_reqs):
             num_computed_before = int(num_computed_tokens_cpu[row])
             prompt_len = int(num_prompt_tokens[row])
@@ -350,12 +352,14 @@ class AscendDSparkProposer(AscendDflashProposer):
             is_prefill.append(row_is_prefill)
             finishes_prefill.append(row_is_prefill and num_computed_before + scheduled >= prompt_len)
             prompt_lens.append(prompt_len)
+            num_computed_tokens.append(num_computed_before)
         return DSparkDecodeOnlyRequestMeta(
             request_rows=list(range(num_reqs)),
             request_ids=list(req_ids),
             is_prefill=is_prefill,
             finishes_prefill=finishes_prefill,
             prompt_lens=prompt_lens,
+            num_computed_tokens=num_computed_tokens,
         )
 
     def _collect_eligible_rows(self, meta: DSparkDecodeOnlyRequestMeta) -> tuple[list[int], list[int], list[int]]:
@@ -406,9 +410,10 @@ class AscendDSparkProposer(AscendDflashProposer):
     def stage_prefill_context(
         self,
         meta: DSparkDecodeOnlyRequestMeta,
-        raw_target_hidden_states: torch.Tensor,
+        raw_target_hidden_states: torch.Tensor | None,
         target_positions: torch.Tensor,
         query_start_loc_cpu: torch.Tensor,
+        raw_aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> None:
         """Stage raw target auxiliary hidden states for every prefill row.
 
@@ -417,6 +422,12 @@ class AscendDSparkProposer(AscendDflashProposer):
         draft head: those all belong to the lazy-init / proposal phases.
         """
         qsl = query_start_loc_cpu
+        if self._dspark_retained_context_tokens is not None:
+            logger.info_once(
+                "[dspark/decode_only] suffix-only staging active: "
+                "retained_context_tokens=%d; earlier prefill chunks are not copied",
+                self._dspark_retained_context_tokens,
+            )
         for row, req_id in enumerate(meta.request_ids):
             if not meta.is_prefill[row]:
                 continue
@@ -441,18 +452,47 @@ class AscendDSparkProposer(AscendDflashProposer):
 
             start = int(qsl[row])
             end = int(qsl[row + 1])
-            raw_slice = raw_target_hidden_states[start:end]
-            pos_slice = target_positions[start:end]
 
             if ctx.phase == DSparkRequestPhase.FALLBACK_PREFILL:
-                # Already fell back: project this chunk directly, no staging.
-                self._project_live_chunk(ctx, row, raw_slice, pos_slice)
+                # Already fell back: project every live chunk directly, no
+                # retained-suffix filtering is allowed in this mode.
+                raw_slice = self._materialize_raw_hidden(
+                    raw_target_hidden_states,
+                    raw_aux_hidden_states,
+                    start,
+                    end,
+                )
+                self._project_live_chunk(ctx, row, raw_slice, target_positions[start:end])
                 if meta.finishes_prefill[row]:
                     pass  # eligibility handled by _collect_eligible_rows
                 continue
 
+            # When all draft attention groups are sliding-window, only the
+            # suffix can ever be read by DSpark. Avoid materializing/cloning
+            # earlier prefill chunks at all; the previous implementation
+            # cloned the full chunk and discarded it in _trim_staged_prefix.
+            keep = ctx.retained_context_tokens
+            computed_before = (
+                meta.num_computed_tokens[row] if len(meta.num_computed_tokens) > row else 0
+            )
+            retain_start = max(0, ctx.prompt_len - keep) if keep is not None else computed_before
+            local_offset = max(0, retain_start - computed_before)
+            if keep is not None and local_offset >= end - start:
+                if meta.finishes_prefill[row]:
+                    ctx.phase = DSparkRequestPhase.PENDING_INIT
+                    self._refresh_staging_stats()
+                continue
+
+            stage_start = start + local_offset
+            pos_slice = target_positions[stage_start:end]
+
             try:
-                hidden = raw_slice.detach().clone()
+                hidden = self._materialize_raw_hidden(
+                    raw_target_hidden_states,
+                    raw_aux_hidden_states,
+                    stage_start,
+                    end,
+                )
                 positions = pos_slice.detach().to(torch.int32).clone()
             except _STAGING_ALLOC_ERRORS:
                 self._dspark_stats["fallbacks_alloc"] += 1
@@ -461,7 +501,18 @@ class AscendDSparkProposer(AscendDflashProposer):
                     "%s; falling back to prefill_tail for this request.",
                     req_id,
                 )
-                self._fallback_prefill_tail(ctx, row, live_raw=raw_slice, live_pos=pos_slice)
+                raw_slice = self._materialize_raw_hidden(
+                    raw_target_hidden_states,
+                    raw_aux_hidden_states,
+                    start,
+                    end,
+                )
+                self._fallback_prefill_tail(
+                    ctx,
+                    row,
+                    live_raw=raw_slice,
+                    live_pos=target_positions[start:end],
+                )
                 continue
 
             chunk = StagedDSparkChunk(
@@ -485,6 +536,24 @@ class AscendDSparkProposer(AscendDflashProposer):
             if meta.finishes_prefill[row]:
                 ctx.phase = DSparkRequestPhase.PENDING_INIT
                 self._refresh_staging_stats()
+
+    @staticmethod
+    def _materialize_raw_hidden(
+        raw_target_hidden_states: torch.Tensor | None,
+        raw_aux_hidden_states: list[torch.Tensor] | None,
+        start: int,
+        end: int,
+    ) -> torch.Tensor:
+        """Build an owned raw-hidden slice without copying unused prefill rows."""
+        if raw_aux_hidden_states is not None:
+            if len(raw_aux_hidden_states) == 1:
+                return raw_aux_hidden_states[0][start:end].detach().clone()
+            # torch.cat allocates independent storage, so an additional clone
+            # would duplicate the entire selected slice unnecessarily.
+            return torch.cat([hidden[start:end] for hidden in raw_aux_hidden_states], dim=-1).detach()
+        if raw_target_hidden_states is None:
+            raise RuntimeError("DSpark decode-only requires raw auxiliary hidden states.")
+        return raw_target_hidden_states[start:end].detach().clone()
 
     def _trim_staged_prefix(self, ctx: PendingDSparkContext) -> None:
         """Keep only the last ``retained_context_tokens`` staged positions."""
@@ -904,13 +973,14 @@ class AscendDSparkProposer(AscendDflashProposer):
         next_token_ids: torch.Tensor,
         target_token_ids: torch.Tensor,
         target_positions: torch.Tensor,
-        raw_target_hidden_states: torch.Tensor,
+        raw_target_hidden_states: torch.Tensor | None,
         num_scheduled_tokens: dict[str, int],
         req_ids: list[str],
         num_computed_tokens_cpu,
         num_prompt_tokens,
         target_model_batch_desc,
         sampling_metadata,
+        raw_aux_hidden_states: list[torch.Tensor] | None = None,
     ) -> torch.Tensor | None:
         """DSpark decode-only orchestration: stage, lazy-init, propose, scatter."""
         with record_function_or_nullcontext("dspark_decode_proposal"):
@@ -924,6 +994,7 @@ class AscendDSparkProposer(AscendDflashProposer):
                 target_token_ids=target_token_ids,
                 target_positions=target_positions,
                 raw_target_hidden_states=raw_target_hidden_states,
+                raw_aux_hidden_states=raw_aux_hidden_states,
                 num_scheduled_tokens=num_scheduled_tokens,
                 req_ids=req_ids,
                 num_computed_tokens_cpu=num_computed_tokens_cpu,
@@ -956,7 +1027,8 @@ class AscendDSparkProposer(AscendDflashProposer):
         next_token_ids: torch.Tensor,
         target_token_ids: torch.Tensor,
         target_positions: torch.Tensor,
-        raw_target_hidden_states: torch.Tensor,
+        raw_target_hidden_states: torch.Tensor | None,
+        raw_aux_hidden_states: list[torch.Tensor] | None,
         num_scheduled_tokens: dict[str, int],
         req_ids: list[str],
         num_computed_tokens_cpu,
@@ -985,6 +1057,7 @@ class AscendDSparkProposer(AscendDflashProposer):
                     raw_target_hidden_states,
                     flat_positions,
                     common_attn_metadata.query_start_loc_cpu,
+                    raw_aux_hidden_states=raw_aux_hidden_states,
                 )
 
         pending_rows, ready_rows, fallback_final_rows = self._collect_eligible_rows(meta)
@@ -1016,6 +1089,12 @@ class AscendDSparkProposer(AscendDflashProposer):
             return None
 
         full_drafts = torch.zeros((num_reqs, self.num_speculative_tokens), dtype=torch.int64, device=self.device)
+        if raw_target_hidden_states is None:
+            if raw_aux_hidden_states is None:
+                raise RuntimeError("DSpark decode-only proposal has no raw hidden states.")
+            raw_target_hidden_states = torch.cat(
+                [hidden[: target_positions.shape[-1]] for hidden in raw_aux_hidden_states], dim=-1
+            ).detach()
         prefill_rows = sum(meta.is_prefill)
         if prefill_rows:
             logger.info_once(
