@@ -564,14 +564,19 @@ class AscendDSparkProposer(AscendDflashProposer):
                 ctx.num_staged_bytes += _tensor_bytes(hidden) + _tensor_bytes(positions)
                 self._total_staged_bytes += _tensor_bytes(hidden) + _tensor_bytes(positions)
             reason = ctx.fallback_reason or "overflow"
+            max_tokens, max_bytes_total, _ = self._decode_only_limits()
+            # Keep this as one fully-rendered line.  Besides identifying the
+            # violated limit, it makes it explicit that context projection is
+            # being put back on the prefill critical path for this request.
             logger.warning(
-                "[dspark/decode_only] request %s exceeds staging limits "
-                "(reason=%s, staged_tokens=%d, staged_bytes=%d); falling back "
-                "to prefill_tail for this request.",
-                ctx.request_id,
-                reason,
-                ctx.num_staged_tokens,
-                ctx.num_staged_bytes,
+                f"[dspark/decode_only] fallback_prefill_tail=true "
+                f"context_projection_in_prefill=true request={ctx.request_id} "
+                f"reason={reason} prompt_tokens={ctx.prompt_len} "
+                f"staged_tokens={ctx.num_staged_tokens} "
+                f"max_staged_tokens_per_request={max_tokens} "
+                f"staged_bytes={ctx.num_staged_bytes} "
+                f"total_staged_bytes={self._total_staged_bytes} "
+                f"max_staged_bytes_total={max_bytes_total}"
             )
             self._project_staged_contexts([ctx], [request_row])
             self._release_staging(ctx)
