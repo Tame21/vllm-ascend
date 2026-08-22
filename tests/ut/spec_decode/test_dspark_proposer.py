@@ -927,9 +927,9 @@ class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
         indexes positions by token and would otherwise interleave rope
         coords into the context/query positions."""
         proposer = self._make_decode_only_proposer()
+        self._make_pending_context(proposer, "r0", phase=DSparkRequestPhase.READY)
         self._make_pending_context(proposer, "r1", phase=DSparkRequestPhase.READY)
-        # r0: prefill rows 0..1; r1: decode rows 2..4.
-        num_computed = np.array([4, 20], dtype=np.int64)
+        num_computed = np.array([20, 20], dtype=np.int64)
         prompt_lens = np.array([12, 12], dtype=np.int64)
         scheduled = {"r0": 2, "r1": 3}
         cad = self._make_cad(2, [0, 2, 5])
@@ -939,13 +939,9 @@ class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
 
         def fake_propose(**kwargs):
             captured.update(kwargs)
-            # Only r1 (one decode row) is eligible here.
-            return torch.ones(1, k, dtype=torch.int64)
+            return torch.ones(2, k, dtype=torch.int64)
 
-        with (
-            patch.object(proposer, "_propose", side_effect=fake_propose),
-            patch.object(proposer, "_project_staged_contexts"),
-        ):
+        with patch.object(proposer, "_propose", side_effect=fake_propose):
             proposer.propose_decode_only(
                 scheduler_output=SimpleNamespace(num_scheduled_tokens=scheduled),
                 common_attn_metadata=cad,
@@ -964,13 +960,9 @@ class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
                 sampling_metadata=None,
             )
 
-        sub_positions = captured["target_positions"]
-        # Flattened to the first rope dim and compacted to r1's tokens.
-        assert sub_positions.dim() == 1
-        assert torch.equal(sub_positions, rope[0, 2:5])
-        # Staged positions are flat 1-D from the first rope dim.
-        ctx0 = proposer._pending_contexts["r0"]
-        assert ctx0.chunks[0].positions.dim() == 1
+        proposed_positions = captured["target_positions"]
+        assert proposed_positions.dim() == 1
+        assert torch.equal(proposed_positions, rope[0])
 
     def test_prefill_only_step_publishes_empty_mask_without_proposal(self):
         proposer = self._make_decode_only_proposer()
@@ -1001,7 +993,7 @@ class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
         assert proposer.take_last_draft_valid_mask() == [False, False]
         assert proposer._pending_contexts["r1"].phase == DSparkRequestPhase.PENDING_INIT
 
-    def test_mixed_batch_compacts_eligible_and_scatters(self):
+    def test_mixed_batch_prefill_barrier_defers_all_dspark_work(self):
         proposer = self._make_decode_only_proposer()
         # r0: collecting prefill (2 tokens); r1: first decode (3 tokens);
         # r2: ready decode (2 tokens).
@@ -1012,18 +1004,9 @@ class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
         scheduled = {"r0": 2, "r1": 3, "r2": 2}
         qsl = [0, 2, 5, 7]
         cad = self._make_cad(3, qsl)
-        k = proposer.num_speculative_tokens
-        sub_drafts = torch.arange(2 * k, dtype=torch.int64).view(2, k) + 1
-
-        captured = {}
-
-        def fake_propose(**kwargs):
-            captured.update(kwargs)
-            return sub_drafts
-
         with (
-            patch.object(proposer, "_propose", side_effect=fake_propose),
-            patch.object(proposer, "_project_staged_contexts") as mock_project,
+            patch.object(proposer, "initialize_pending_contexts") as mock_init,
+            patch.object(proposer, "_propose") as mock_propose,
         ):
             drafts = proposer.propose_decode_only(
                 scheduler_output=SimpleNamespace(num_scheduled_tokens=scheduled),
@@ -1034,7 +1017,8 @@ class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
                 next_token_ids=torch.arange(3, dtype=torch.int64),
                 target_token_ids=torch.arange(7, dtype=torch.int64),
                 target_positions=torch.arange(7, dtype=torch.int32),
-                raw_target_hidden_states=torch.randn(7, 8),
+                raw_target_hidden_states=None,
+                raw_aux_hidden_states=[torch.randn(7, 3), torch.randn(7, 5)],
                 num_scheduled_tokens=scheduled,
                 req_ids=["r0", "r1", "r2"],
                 num_computed_tokens_cpu=num_computed,
@@ -1043,21 +1027,52 @@ class TestDSparkDecodeOnlyProposal(_DSparkDecodeOnlyTestBase):
                 sampling_metadata=None,
             )
 
-        # Lazy init ran for r1's staged prompt context only.
+        mock_init.assert_not_called()
+        mock_propose.assert_not_called()
+        assert drafts is None
+        assert proposer.take_last_draft_valid_mask() == [False, False, False]
+        # The prefill row is staged, while decode rows keep their states for a
+        # later pure-decode batch.
+        assert proposer._pending_contexts["r0"].num_staged_tokens == 2
+        assert proposer._pending_contexts["r1"].phase == DSparkRequestPhase.PENDING_INIT
+        assert proposer._pending_contexts["r1"].num_staged_tokens == 12
+        assert proposer._pending_contexts["r2"].phase == DSparkRequestPhase.READY
+
+    def test_prefill_barrier_makes_completed_fallback_decode_ready(self):
+        proposer = self._make_decode_only_proposer()
+        self._make_pending_context(
+            proposer,
+            "r0",
+            phase=DSparkRequestPhase.FALLBACK_PREFILL,
+        )
+        scheduled = {"r0": 2}
+        cad = self._make_cad(1, [0, 2])
+        with (
+            patch.object(proposer, "_project_live_chunk") as mock_project,
+            patch.object(proposer, "_propose") as mock_propose,
+        ):
+            drafts = proposer.propose_decode_only(
+                scheduler_output=SimpleNamespace(num_scheduled_tokens=scheduled),
+                common_attn_metadata=cad,
+                token_indices=None,
+                token_indices_to_sample=None,
+                num_rejected_tokens_gpu=None,
+                next_token_ids=torch.zeros(1, dtype=torch.int64),
+                target_token_ids=torch.zeros(2, dtype=torch.int64),
+                target_positions=torch.arange(2, dtype=torch.int32),
+                raw_target_hidden_states=torch.randn(2, 8),
+                num_scheduled_tokens=scheduled,
+                req_ids=["r0"],
+                num_computed_tokens_cpu=np.array([10], dtype=np.int64),
+                num_prompt_tokens=np.array([12], dtype=np.int64),
+                target_model_batch_desc=SimpleNamespace(uniform=False),
+                sampling_metadata=None,
+            )
+
         mock_project.assert_called_once()
-        # Proposal received the compact subbatch: rows 1..2, tokens 2..7.
-        assert captured["target_token_ids"].tolist() == [2, 3, 4, 5, 6]
-        assert captured["next_token_ids"].tolist() == [1, 2]
-        assert captured["common_attn_metadata"].num_reqs == 2
-        assert captured["common_attn_metadata"].query_start_loc_cpu.tolist() == [0, 3, 5]
-        # Scatter: row 0 stays zero (invalid), rows 1-2 carry the sub drafts.
-        assert torch.equal(drafts[0], torch.zeros(k, dtype=torch.int64))
-        assert torch.equal(drafts[1], sub_drafts[0])
-        assert torch.equal(drafts[2], sub_drafts[1])
-        assert proposer.take_last_draft_valid_mask() == [False, True, True]
-        # r1 transitioned to READY after its first proposal.
-        assert proposer._pending_contexts["r1"].phase == DSparkRequestPhase.READY
-        assert proposer._pending_contexts["r1"].num_staged_tokens == 0
+        mock_propose.assert_not_called()
+        assert drafts is None
+        assert proposer._pending_contexts["r0"].phase == DSparkRequestPhase.READY
 
     def test_all_eligible_uses_identity_path(self):
         proposer = self._make_decode_only_proposer()

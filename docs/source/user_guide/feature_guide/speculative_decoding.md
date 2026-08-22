@@ -177,7 +177,7 @@ MTP (Multi-Token Prediction) boosts inference performance by parallelizing the p
 
 ## DSpark decode-only prefill
 
-By default (`execution_phase=prefill_tail`), DSpark projects the target context KV and runs its first proposal inside the final prefill step, so the first output token also waits for that DSpark work. With `execution_phase=decode_only`, vLLM Ascend defers all DSpark computation out of prefill: prefill only stages the raw target auxiliary hidden states (plus their positions) on the NPU, the final prefill publishes an empty draft list and returns the first token immediately, and the staged context is lazily projected into the DSpark KV cache right after the first ordinary decode, which then emits the first `num_speculative_tokens` draft tokens. Steady-state speculative decoding is unchanged.
+By default (`execution_phase=prefill_tail`), DSpark projects the target context KV and runs its first proposal inside the final prefill step, so the first output token also waits for that DSpark work. With `execution_phase=decode_only`, vLLM Ascend defers DSpark computation out of every batch that contains a prefill row. Such a batch only stages the retained raw target auxiliary hidden-state suffix (plus positions), publishes no new drafts for any row, and returns its target tokens without DSpark lazy initialization or proposal. Pending initialization and proposals resume in a later pure-decode batch. This batch-wide prefill barrier prevents decode-row DSpark work from delaying other requests' first tokens in mixed batches.
 
 ```shell
 vllm serve <target-model> \
@@ -200,7 +200,8 @@ Configuration fields:
 
 Trade-offs and constraints:
 
-- TTFT no longer waits for DSpark, while the first inter-token latency (ITL) absorbs the deferred lazy initialization; report the first ITL separately when benchmarking.
+- TTFT no longer waits for DSpark lazy initialization or proposal. The first pure-decode batch absorbs deferred initialization, so report the first ITL separately when benchmarking.
+- Decode rows co-batched with prefill rows intentionally publish no new drafts for that step. Workloads with frequent mixed batches trade some speculative decode throughput for TTFT isolation.
 - Staging memory is roughly `retained_tokens * sum(target_aux_hidden_widths) * dtype_size` per request, which is why both limits must be configured explicitly.
 - `decode_only` requires Model Runner V1 (the default on Ascend), synchronous scheduling, prefix caching disabled, no KV transfer / PD disaggregation, and `decode_context_parallel_size=1`; unsupported combinations fail at startup.
 - If a request exceeds a staging limit, it deterministically falls back to the `prefill_tail` behavior for itself only; other requests keep the decode-only path.

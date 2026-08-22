@@ -1060,28 +1060,57 @@ class AscendDSparkProposer(AscendDflashProposer):
                     raw_aux_hidden_states=raw_aux_hidden_states,
                 )
 
+        prefill_rows = sum(meta.is_prefill)
+        valid_mask = [False] * num_reqs
+        if prefill_rows:
+            # A fallback request has already projected every context chunk.
+            # Previously its final-prefill proposal transitioned it to READY;
+            # the barrier suppresses that proposal, so make it decode-ready
+            # here and let the next pure-decode batch emit its first drafts.
+            completed_fallbacks = 0
+            for row, finishes_prefill in enumerate(meta.finishes_prefill):
+                if not finishes_prefill:
+                    continue
+                ctx = self._pending_contexts.get(req_ids[row])
+                if ctx is not None and ctx.phase == DSparkRequestPhase.FALLBACK_PREFILL:
+                    ctx.phase = DSparkRequestPhase.READY
+                    completed_fallbacks += 1
+            if completed_fallbacks:
+                self._refresh_staging_stats()
+
+            # A target batch has one completion boundary. Any DSpark work for
+            # decode rows in a mixed batch therefore sits on the TTFT critical
+            # path of its prefill rows. Defer all lazy init and proposals until
+            # a pure-decode batch; existing decode rows intentionally publish
+            # no drafts for this step.
+            self._last_draft_valid_mask = valid_mask
+            logger.info_once(
+                "[dspark/decode_only] prefill barrier active: DSpark lazy-init "
+                "and proposal are deferred while any prefill row is scheduled"
+            )
+            logger.debug(
+                "[dspark/decode_only] prefill barrier step: prefill_rows=%d, "
+                "deferred_decode_rows=%d, completed_fallbacks=%d, scheduled_tokens=%d",
+                prefill_rows,
+                num_reqs - prefill_rows,
+                completed_fallbacks,
+                sum(num_scheduled_tokens.values()),
+            )
+            return None
+
         pending_rows, ready_rows, fallback_final_rows = self._collect_eligible_rows(meta)
         if pending_rows:
             with record_function_or_nullcontext("dspark_lazy_init"):
                 self.initialize_pending_contexts([req_ids[row] for row in pending_rows], pending_rows)
 
         eligible_rows = sorted(pending_rows + ready_rows + fallback_final_rows)
-        valid_mask = [False] * num_reqs
 
         if not eligible_rows:
-            # Pure prefill: raw auxiliary hidden states have been staged, but
-            # no request is eligible for a draft proposal yet. Returning None
-            # lets ModelRunner skip the draft-token D2H/event path entirely;
-            # the target sampled token can be returned immediately. A
-            # fallback final-prefill row is included in eligible_rows above,
-            # so fallback_prefill_tail keeps its historical proposal behavior.
+            # No decode request has usable DSpark state. Returning None lets
+            # ModelRunner skip the draft-token D2H/event path entirely.
             self._last_draft_valid_mask = valid_mask
-            logger.info_once(
-                "[dspark/decode_only] prefill-only path active: DSpark proposal "
-                "is skipped before the first decode"
-            )
             logger.debug(
-                "[dspark/decode_only] prefill-only step: skipped DSpark proposal "
+                "[dspark/decode_only] decode step has no eligible proposal rows "
                 "(num_reqs=%d, scheduled_tokens=%d)",
                 num_reqs,
                 sum(num_scheduled_tokens.values()),
@@ -1095,18 +1124,6 @@ class AscendDSparkProposer(AscendDflashProposer):
             raw_target_hidden_states = torch.cat(
                 [hidden[: target_positions.shape[-1]] for hidden in raw_aux_hidden_states], dim=-1
             ).detach()
-        prefill_rows = sum(meta.is_prefill)
-        if prefill_rows:
-            logger.info_once(
-                "[dspark/decode_only] mixed-batch path active: DSpark proposal "
-                "is limited to decode-eligible rows"
-            )
-            logger.debug(
-                "[dspark/decode_only] mixed batch: skipped DSpark proposal "
-                "for prefill rows (prefill_rows=%d, proposal_rows=%d)",
-                prefill_rows,
-                len(eligible_rows),
-            )
         sub_drafts = self._propose_compact(
             eligible_rows=eligible_rows,
             common_attn_metadata=common_attn_metadata,

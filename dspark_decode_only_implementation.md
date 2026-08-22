@@ -15,7 +15,8 @@ prefill_tail（默认，行为不变）:
 decode_only（新）:
   prefill chunk(s)  -> 暂存 raw target 辅助 hidden + positions（无任何 DSpark 计算）
   final prefill     -> 发布 spec_token_ids=[]，立即返回首 token
-  第一次普通 decode  -> lazy init（combine + 重建 slot + 写 context KV）-> 首轮 proposal
+  含任意 prefill 的 batch -> 所有行均跳过 DSpark lazy init/proposal
+  第一次纯 decode batch -> lazy init（combine + 重建 slot + 写 context KV）-> 首轮 proposal
   steady-state      -> 与现有一致
 ```
 
@@ -195,7 +196,9 @@ if eligible:
 self._last_draft_valid_mask = valid_mask
 ```
 
-compact 实现（非 identity 时，纯 CPU 索引计算 + GPU `index_select`）：
+只要 batch 中存在任意 prefill 行，staging 完成后立即返回全 False valid mask；同批 `PENDING_INIT`/`READY` decode 行也不执行 lazy init/proposal，状态保持到后续纯 decode batch。这样 mixed batch 中 decode 行的 DSpark 工作不会污染 prefill 行 TTFT。
+
+纯 decode batch 的 compact 实现（非 identity 时，纯 CPU 索引计算 + GPU `index_select`）：
 
 - 用 `query_start_loc_cpu` 计算 eligible 行的 token 数、新 `query_start_loc`、compact→full 的 token 索引数组；
 - 紧凑化 `target_token_ids/positions/hidden/next_token_ids/num_rejected_tokens_gpu/token_indices_to_sample/seq_lens/block_table_tensor/num_computed_tokens_cpu`（`copy.copy(cad)` 后替换字段，不动共享 tensor）；
@@ -240,7 +243,7 @@ def build_dspark_context_slots_kernel(
 
 ### 6.1 decode-only 分支
 
-`propose_draft_token_ids()` 的 eagle/draft-model 共享分支内，在 target sampling / rejected 修正 / `prepare_inputs[_padded]` / raw aux hidden 组装（`torch.cat([h[token_indices] for h in aux_hidden_states], dim=-1)`）完成之后、通用 `drafter._propose(...)` 之前：
+`propose_draft_token_ids()` 的 eagle/draft-model 共享分支内，先执行当前 speculative 验证所需的 `prepare_next_token_ids[_padded]` accepted-token bookkeeping，再检查 batch 是否包含 prefill 行。若包含，在 `prepare_inputs[_padded]` 及任何全量 aux hidden `torch.cat` 之前进入 prefill barrier，直接用原始 target token layout 暂存 retained suffix 并返回空 drafts。纯 decode batch 才继续现有 proposal-input 准备与 proposal：
 
 ```python
 if self._is_dspark_decode_only():
@@ -270,14 +273,15 @@ if self._is_dspark_decode_only():
 ```text
 非 final prefill chunk:
   target forward -> stage（裁剪/记账）-> valid_mask=False -> publish []
-final prefill:
-  target sample 首 token -> stage 最后一段 -> COLLECTING→PENDING_INIT -> publish []
-第一次普通 decode:
+final/mixed prefill:
+  target sample -> stage prefill suffix -> 所有行 publish []
+  pending/ready decode 行不执行 DSpark，状态保持
+第一次纯 decode:
   target 采样第 2 个 token -> lazy init staged prompt context
   -> compact _propose 对本 step hidden 写 context KV + query block
   -> PENDING_INIT→READY -> publish K drafts
 steady-state decode:  与 prefill_tail 完全一致
-mixed batch:          eligible=[pending/ready/fallback-final] 行 compact 后
+mixed batch:          prefill barrier；所有行跳过 DSpark lazy init/proposal
                       scatter 回原序，prefill 行保持 []
 ```
 
@@ -294,7 +298,7 @@ mixed batch:          eligible=[pending/ready/fallback-final] 行 compact 后
 - 单请求 token 超限只回退该请求；全局字节超限计数正确；回退后 chunk 直投；
 - `PENDING_INIT/READY` 重入 prefill 重置 `COLLECTING`；
 - release/invalidate 清理与 generation 递增；lazy init 失败转 INVALID 并抛错；
-- prefill-only step 不调用 `_propose`、mask 全 False；mixed batch compact 的 token/next_token/qsl 断言 + scatter 正确；全 eligible 走 identity 路径。
+- prefill/mixed step 不调用 lazy init 或 `_propose`、mask 全 False；纯 decode 的全 eligible batch 走 identity 路径。
 
 ### 8.2 运行结果
 

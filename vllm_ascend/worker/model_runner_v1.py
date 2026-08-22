@@ -794,8 +794,8 @@ class NPUModelRunner(GPUModelRunner):
             and self.drafter.decode_only
         )
 
-    def _is_dspark_pure_prefill(self, scheduler_output: "SchedulerOutput") -> bool:
-        """Return whether every live row is still in its prompt prefill."""
+    def _has_dspark_prefill_rows(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Return whether any scheduled row is still in prompt prefill."""
         req_ids = self.input_batch.req_ids
         if not req_ids:
             return False
@@ -804,7 +804,7 @@ class NPUModelRunner(GPUModelRunner):
             for row in range(len(req_ids))
             if scheduler_output.num_scheduled_tokens.get(req_ids[row], 0) > 0
         ]
-        return bool(scheduled_rows) and all(
+        return any(
             int(self.input_batch.num_computed_tokens_cpu[row])
             < int(self.input_batch.num_prompt_tokens[row])
             for row in scheduled_rows
@@ -1601,6 +1601,42 @@ class NPUModelRunner(GPUModelRunner):
                 )
                 self._copy_valid_sampled_token_count(next_token_ids, valid_sampled_tokens_count)
 
+            # prepare_next_token_ids() above also publishes accepted-token
+            # counts from the current verification step and must run for
+            # correctness. Everything after that is proposal preparation: if
+            # any row is in prefill, bypass prepare_inputs(), full aux-hidden
+            # concatenation, lazy init, and proposal for the entire batch.
+            if self._is_dspark_decode_only() and self._has_dspark_prefill_rows(scheduler_output):
+                assert isinstance(self.drafter, AscendDSparkProposer)
+                logger.info_once(
+                    "[dspark/decode_only] ModelRunner prefill barrier is "
+                    "bypassing proposal-input preparation and full aux-hidden concat"
+                )
+                return self.drafter.propose_decode_only(
+                    scheduler_output=scheduler_output,
+                    common_attn_metadata=common_attn_metadata,
+                    token_indices=None,
+                    token_indices_to_sample=None,
+                    num_rejected_tokens_gpu=None,
+                    next_token_ids=next_token_ids,
+                    target_token_ids=self.input_ids.gpu[:num_scheduled_tokens],
+                    target_positions=self._get_positions(num_scheduled_tokens),
+                    raw_target_hidden_states=(
+                        None
+                        if self.use_aux_hidden_state_outputs
+                        else hidden_states[:num_scheduled_tokens]
+                    ),
+                    raw_aux_hidden_states=(
+                        aux_hidden_states if self.use_aux_hidden_state_outputs else None
+                    ),
+                    num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
+                    req_ids=self.input_batch.req_ids,
+                    num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu,
+                    num_prompt_tokens=self.input_batch.num_prompt_tokens,
+                    target_model_batch_desc=target_model_batch_desc,
+                    sampling_metadata=sampling_metadata,
+                )
+
             req_scheduled_tokens = scheduler_output.num_scheduled_tokens
             if self.use_dcp:
                 long_seq_metadata = self.long_seq_metadata  # type: ignore
@@ -1628,16 +1664,9 @@ class NPUModelRunner(GPUModelRunner):
                 target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
                 target_positions = self._get_positions(num_scheduled_tokens)
                 if self.use_aux_hidden_state_outputs:
-                    # DSpark decode-only stages only the retained context
-                    # suffix on a pure prefill step. Defer concatenating the
-                    # full aux-hidden prompt until a proposal is actually
-                    # needed (mixed/fallback/decode paths).
-                    if self._is_dspark_decode_only() and self._is_dspark_pure_prefill(scheduler_output):
-                        target_hidden_states = None
-                    else:
-                        target_hidden_states = torch.cat(
-                            [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
-                        )
+                    target_hidden_states = torch.cat(
+                        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
+                    )
                 else:
                     target_hidden_states = hidden_states[:num_scheduled_tokens]
             else:
@@ -1676,12 +1705,7 @@ class NPUModelRunner(GPUModelRunner):
                     target_token_ids=target_token_ids,
                     target_positions=target_positions,
                     raw_target_hidden_states=target_hidden_states,
-                    raw_aux_hidden_states=(
-                        aux_hidden_states
-                        if spec_decode_metadata is None
-                        and self._is_dspark_pure_prefill(scheduler_output)
-                        else None
-                    ),
+                    raw_aux_hidden_states=None,
                     num_scheduled_tokens=scheduler_output.num_scheduled_tokens,
                     req_ids=self.input_batch.req_ids,
                     num_computed_tokens_cpu=self.input_batch.num_computed_tokens_cpu,
@@ -2316,7 +2340,7 @@ class NPUModelRunner(GPUModelRunner):
                 self._draft_token_valid_mask_cpu = None
                 logger.info_once(
                     "[dspark/decode_only] ModelRunner is skipping draft-token "
-                    "copy/sync on prefill-only steps"
+                    "copy/sync on prefill-barrier steps"
                 )
             else:
                 self._copy_draft_token_ids_to_cpu(scheduler_output)
