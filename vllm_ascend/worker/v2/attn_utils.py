@@ -228,9 +228,8 @@ def build_attn_metadata(
             else {}
         )
 
-        group_attn_metadata = AscendCommonAttentionMetadata(
-            query_start_loc=query_start_loc_gpu,
-            query_start_loc_cpu=query_start_loc_cpu,
+        group_is_prefilling = common_attn_metadata_extra_kwargs.pop(
+            "is_prefilling", is_prefilling
         )
 
         common_attn_metadata = AscendCommonAttentionMetadata(
@@ -248,7 +247,7 @@ def build_attn_metadata(
             attn_state=attn_state,
             graph_pad_size=graph_pad_size,
             num_input_tokens=num_input_tokens,
-            is_prefilling=group_attn_metadata,
+            is_prefilling=group_is_prefilling,
             max_seq_len=max_seq_len,
             causal=group_causal,
             **common_attn_metadata_extra_kwargs,
