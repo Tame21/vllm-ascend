@@ -39,7 +39,6 @@ from vllm.v1.worker.gpu.input_batch import (
 from vllm.v1.worker.gpu.model_runner import (
     ExecuteModelState,
     GPUModelRunner,
-    sort_batch_req_ids,
 )
 
 from vllm_ascend.ascend_config import get_ascend_config
@@ -70,6 +69,30 @@ from vllm_ascend.worker.v2.spec_decode import init_speculator
 from vllm_ascend.worker.v2.spec_decode.eagle.speculator import AscendEagleSpeculator
 from vllm_ascend.worker.v2.states import AscendRequestState
 from vllm_ascend.worker.v2.utils import torch_cuda_wrapper
+
+
+def _sort_batch_req_ids(
+    num_tokens_per_req: dict[str, int],
+    draft_tokens: dict[str, list[int]],
+    decode_query_len: int,
+) -> list[str]:
+    """Keep all verification requests ahead of prefills.
+
+    A verification request can contain fewer than ``decode_query_len`` tokens
+    when the scheduler trims its draft block to fit the current token budget.
+    Sorting only by query length can then place a short prefill before that
+    verification request. Attention metadata builders require the batch to be
+    ordered decode/verification -> short extend -> prefill, so that ordering
+    corrupts the request boundary in mixed high-concurrency batches.
+
+    This backports the request ordering used by newer vLLM model runner V2.
+    """
+    key = lambda req_id: (
+        not draft_tokens.get(req_id),
+        (num_tokens := num_tokens_per_req[req_id]) != decode_query_len,
+        num_tokens,
+    )
+    return sorted(num_tokens_per_req, key=key)
 
 
 class NPUModelRunner(GPUModelRunner):
@@ -275,7 +298,11 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_per_req = scheduler_output.num_scheduled_tokens
             num_reqs = len(num_tokens_per_req)
 
-            req_ids = sort_batch_req_ids(num_tokens_per_req, self.decode_query_len)
+            req_ids = _sort_batch_req_ids(
+                num_tokens_per_req,
+                scheduler_output.scheduled_spec_decode_tokens,
+                self.decode_query_len,
+            )
 
             self._update_seq_lens_cpu(scheduler_output, req_ids)
 
@@ -488,7 +515,7 @@ class NPUModelRunner(GPUModelRunner):
             num_tokens_per_req = scheduler_output.num_scheduled_tokens
             num_reqs = len(num_tokens_per_req)
 
-            req_ids = sort_batch_req_ids(
+            req_ids = _sort_batch_req_ids(
                 num_tokens_per_req,
                 scheduler_output.scheduled_spec_decode_tokens,
                 self.decode_query_len,
