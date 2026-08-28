@@ -27,6 +27,16 @@
 # ----------------------------------------------------------------------------------
 
 # What's Patched and how it works:
+#
+# worker/patch_qwen3_5_dense_lora.py and worker/patch_lora_acl_graph.py:
+#   Opt-in compatibility fixes for Qwen3.5 dense LoRA on vLLM 0.25.1:
+#   packed LoRA-B expansion, verified language-module prefix mapping, FIA-only
+#   replay metadata, and separate base/LoRA compilation and ACL graph params.
+#   Enable with additional_config.enable_qwen3_5_lora_patch=true. See
+#   worker/README_qwen3_5_lora.md for supported settings and validation limits.
+#   These replace the external v0.23 patches; do not install both versions.
+#   No upstream PR yet. Remove when the supported release contains equivalent
+#   fixes in Punica, attention replay, compilation and NPU dummy capture.
 # --------------------------------
 # * Platform Patch:
 # =================
