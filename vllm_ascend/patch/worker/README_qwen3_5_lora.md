@@ -5,30 +5,25 @@ and `patch_lora_acl_graph_v23.py` from the external v0.23 workaround.
 Do not install the external scripts alongside these patches.
 
 The worker loader imports both modules only for vLLM 0.25.1 on non-310P
-devices. Behavior is opt-in and restricted to `qwen3_5_text` dense models
-with LoRA enabled. The disabled path retains the original implementations.
+devices. They are automatically enabled only for `qwen3_5_text` dense models
+with LoRA enabled. Other models and runs without LoRA retain the original
+implementations.
 
 ## Enable
 
-Merge the following options into your existing launch command (Linux):
+Use the normal LoRA launch command; no feature flag, environment variable or
+extra compilation configuration is required:
 
 ```bash
-export VLLM_USE_AOT_COMPILE=0
-export VLLM_USE_BYTECODE_HOOK=0
-export VLLM_USE_V2_MODEL_RUNNER=0
-
 vllm serve /path/to/Qwen3.5-dense \
   --enable-lora \
   --max-lora-rank 64 \
-  --lora-modules adapter=/path/to/adapter \
-  --additional-config '{"enable_qwen3_5_lora_patch": true, "ascend_compilation_config": {"enable_npugraph_ex": false}}' \
-  --compilation-config '{"mode": 3, "cudagraph_mode": "FULL_DECODE_ONLY", "cudagraph_specialize_lora": true}'
+  --lora-modules adapter=/path/to/adapter
 ```
 
-Preserve any other keys already present in `--additional-config` and
-`--compilation-config`. Restart all workers after updating the files.
-Graph isolation also requires `dynamic_shapes_config.evaluate_guards=false`
-(the default). No extra external `install(register_func)` call is needed.
+Restart all workers after updating the files. The platform patch selects the
+compatible graph backend automatically. No external `install(register_func)`
+call is needed.
 
 ## What changes
 
@@ -50,10 +45,10 @@ tag `v0.25.1`, not a claim of upstream or NPU validation. The intended initial
 deployment is A2/A3, runner v1, dense Qwen3.5, language-model LoRA, rank <= 64,
 no speculative decoding. MoE and 310P are outside this patch's scope.
 Speculative decoding, runner v2, rank > 64, context parallelism, microbatching,
-sleep mode and fully sharded LoRA are rejected when enabled. Graph isolation
-also rejects npugraph_ex (which defaults to true in this checkout, so explicitly
-disable it as above). Vision/connector adapters are outside the supported scope.
-The fallback can be slower than native kernels.
+sleep mode and fully sharded LoRA are rejected for matching deployments. Graph
+isolation also disables npugraph_ex automatically. Vision/connector adapters
+are outside the supported scope. The fallback can be slower than native
+kernels.
 
 Before deployment, compare eager and graph outputs for the base model and
 each adapter; alternate base/adapter requests at the same token count; test

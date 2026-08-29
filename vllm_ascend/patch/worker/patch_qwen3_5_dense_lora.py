@@ -1,9 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in Qwen3.5 dense LoRA fixes for the vLLM 0.25.1 release lane.
-
-Enable with additional_config.enable_qwen3_5_lora_patch=true. Do not load the
-external v0.23 patches alongside this module.
-"""
+"""Qwen3.5 dense LoRA fixes for the vLLM 0.25.1 release lane."""
 
 from copy import copy
 from functools import wraps
@@ -19,17 +15,16 @@ from vllm_ascend.attention.utils import using_paged_attention
 from vllm_ascend.lora.punica_npu import PunicaWrapperNPU
 
 
-def patch_enabled(config) -> bool:
+def patch_applies(config) -> bool:
     return bool(
-        (config.additional_config or {}).get("enable_qwen3_5_lora_patch", False)
-        and config.lora_config is not None
+        config.lora_config is not None
         and getattr(config.model_config.hf_text_config, "model_type", None) == "qwen3_5_text"
     )
 
 
 def specialize_lora(config) -> bool:
     return bool(
-        patch_enabled(config)
+        patch_applies(config)
         and not config.model_config.enforce_eager
         and config.compilation_config.cudagraph_mode != CUDAGraphMode.NONE
         and config.compilation_config.cudagraph_specialize_lora
@@ -37,7 +32,7 @@ def specialize_lora(config) -> bool:
 
 
 def validate_config(config):
-    if not patch_enabled(config):
+    if not patch_applies(config):
         return
     if config.use_v2_model_runner:
         raise ValueError("The Qwen3.5 LoRA patch supports model runner v1 only")
@@ -54,10 +49,6 @@ def validate_config(config):
         raise ValueError("The Qwen3.5 LoRA patch does not support microbatching")
     if config.model_config.enable_sleep_mode:
         raise ValueError("The Qwen3.5 LoRA patch has not been validated with sleep mode")
-    if specialize_lora(config):
-        ascend_compile = (config.additional_config or {}).get("ascend_compilation_config", {})
-        if ascend_compile.get("enable_npugraph_ex", True):
-            raise ValueError("Qwen3.5 LoRA graph isolation requires ascend_compilation_config.enable_npugraph_ex=false")
 
 
 @torch.library.custom_op("vllm_ascend::qwen3_5_lora_expand_slice", mutates_args={"y"})
@@ -145,7 +136,7 @@ _ORIGINAL_UPDATE_GRAPH_PARAMS = AscendAttentionBackendImpl.update_graph_params
 
 @wraps(_ORIGINAL_MANAGER_INIT)
 def _manager_init(self, model, max_num_seqs, max_num_batched_tokens, vocab_size, lora_config, device, vllm_config):
-    enabled = patch_enabled(vllm_config)
+    enabled = patch_applies(vllm_config)
     validate_config(vllm_config)
     _ORIGINAL_MANAGER_INIT(
         self, model, max_num_seqs, max_num_batched_tokens, vocab_size, lora_config, device, vllm_config
@@ -195,7 +186,7 @@ def update_graph_params(
     update_stream, forward_context, num_tokens, vllm_config, speculative_config=None, draft_attn_metadatas=None
 ):
     if (
-        patch_enabled(vllm_config)
+        patch_applies(vllm_config)
         and not _EXTRA_CTX.is_draft_model
         and not using_paged_attention(num_tokens, vllm_config)
         and isinstance(forward_context.attn_metadata, dict)

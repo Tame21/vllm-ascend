@@ -129,15 +129,21 @@ def _wrapper_init(self, compile_prefix="", is_encoder=False):
     enabled = specialize_lora(config) and backends.model_tag == "backbone" and not is_encoder
     if enabled:
         validate_config(config)
-        if vllm_envs.VLLM_USE_AOT_COMPILE or vllm_envs.VLLM_USE_BYTECODE_HOOK:
-            raise ValueError(
-                "Qwen3.5 LoRA graph isolation requires VLLM_USE_AOT_COMPILE=0 and VLLM_USE_BYTECODE_HOOK=0"
-            )
+        if vllm_envs.VLLM_USE_AOT_COMPILE:
+            raise ValueError("Qwen3.5 LoRA graph isolation does not support VLLM_USE_AOT_COMPILE=1")
         if config.compilation_config.mode != CompilationMode.VLLM_COMPILE:
             raise ValueError("Qwen3.5 LoRA graph isolation requires CompilationMode.VLLM_COMPILE")
         if config.compilation_config.dynamic_shapes_config.evaluate_guards:
             raise ValueError("Qwen3.5 LoRA graph isolation requires dynamic_shapes_config.evaluate_guards=false")
-    _ORIGINAL_WRAPPER_INIT(self, compile_prefix=compile_prefix, is_encoder=is_encoder)
+    if enabled:
+        previous_bytecode_hook = vllm_envs.VLLM_USE_BYTECODE_HOOK
+        vllm_envs.VLLM_USE_BYTECODE_HOOK = False
+        try:
+            _ORIGINAL_WRAPPER_INIT(self, compile_prefix=compile_prefix, is_encoder=is_encoder)
+        finally:
+            vllm_envs.VLLM_USE_BYTECODE_HOOK = previous_bytecode_hook
+    else:
+        _ORIGINAL_WRAPPER_INIT(self, compile_prefix=compile_prefix, is_encoder=is_encoder)
     self._ascend_specialize_lora = enabled
     if not enabled:
         return
@@ -179,17 +185,26 @@ def _mark_base_dynamic_inputs(self, *args, **kwargs):
 
 @wraps(_ORIGINAL_WRAPPER_CALL)
 def _wrapper_call(self, *args, **kwargs):
-    if not getattr(self, "_ascend_specialize_lora", False) or self._ascend_has_lora():
+    if not getattr(self, "_ascend_specialize_lora", False):
         return _ORIGINAL_WRAPPER_CALL(self, *args, **kwargs)
-    descriptor = get_forward_context().batch_descriptor if is_forward_context_available() else None
-    if descriptor is not None and descriptor.num_tokens == 1:
-        callable_fn = self._ascend_base_one_callable
+    if self._ascend_has_lora():
+        callable_fn = self._compiled_callable
     else:
-        callable_fn = self._ascend_base_callable
-        if not self._ascend_base_dynamic_inputs_marked:
-            self._ascend_mark_base_dynamic_inputs(*args, **kwargs)
-            self._ascend_base_dynamic_inputs_marked = True
-    with wrapper_module._compilation_context():
+        descriptor = get_forward_context().batch_descriptor if is_forward_context_available() else None
+        if descriptor is not None and descriptor.num_tokens == 1:
+            callable_fn = self._ascend_base_one_callable
+        else:
+            callable_fn = self._ascend_base_callable
+            if not self._ascend_base_dynamic_inputs_marked:
+                self._ascend_mark_base_dynamic_inputs(*args, **kwargs)
+                self._ascend_base_dynamic_inputs_marked = True
+    context = (
+        nullcontext()
+        if self.first_compile or not self.evaluate_guards
+        else torch.compiler.set_stance("fail_on_recompile")
+    )
+    self.first_compile = False
+    with wrapper_module._compilation_context(), context:
         return self._call_with_optional_nvtx_range(callable_fn, *args, **kwargs)
 
 
