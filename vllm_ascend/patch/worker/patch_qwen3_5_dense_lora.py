@@ -38,8 +38,9 @@ def validate_config(config):
         raise ValueError("The Qwen3.5 LoRA patch supports model runner v1 only")
     if config.lora_config.max_lora_rank > 64:
         raise ValueError("The Qwen3.5 LoRA patch currently supports max_lora_rank <= 64 only")
-    if config.speculative_config is not None:
-        raise ValueError("The Qwen3.5 LoRA patch has not been validated with speculative decoding")
+    speculative_config = config.speculative_config
+    if speculative_config is not None and speculative_config.method != "mtp":
+        raise ValueError("The Qwen3.5 LoRA patch supports MTP speculative decoding only")
     if config.lora_config.fully_sharded_loras:
         raise ValueError("The Qwen3.5 LoRA patch has not been validated with fully sharded LoRA")
     parallel = config.parallel_config

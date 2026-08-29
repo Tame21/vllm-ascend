@@ -43,12 +43,12 @@ The first module still provides LoRA-B and name/metadata fixes in eager mode.
 This is a local compatibility patch against Ascend commit `3cb3f83` and vLLM
 tag `v0.25.1`, not a claim of upstream or NPU validation. The intended initial
 deployment is A2/A3, runner v1, dense Qwen3.5, language-model LoRA, rank <= 64,
-no speculative decoding. MoE and 310P are outside this patch's scope.
-Speculative decoding, runner v2, rank > 64, context parallelism, microbatching,
-sleep mode and fully sharded LoRA are rejected for matching deployments. Graph
-isolation also disables npugraph_ex automatically. Vision/connector adapters
-are outside the supported scope. The fallback can be slower than native
-kernels.
+with optional MTP speculative decoding. MoE and 310P are outside this patch's
+scope. Non-MTP speculative decoding, runner v2, rank > 64, context parallelism,
+microbatching, sleep mode and fully sharded LoRA are rejected for matching
+deployments. Graph isolation also disables npugraph_ex automatically.
+Vision/connector adapters are outside the supported scope. The fallback can be
+slower than native kernels.
 
 Before deployment, compare eager and graph outputs for the base model and
 each adapter; alternate base/adapter requests at the same token count; test
