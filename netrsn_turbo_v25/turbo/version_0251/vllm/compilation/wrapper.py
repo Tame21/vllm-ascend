@@ -3,24 +3,34 @@
 """Base/LoRA callable isolation for the vLLM compile wrapper."""
 
 import inspect
+import os
 from contextlib import nullcontext
 from functools import wraps
 from types import FunctionType, MethodType
 
 import torch
 import vllm.envs as vllm_envs
-from vllm.compilation import backends
+from vllm.compilation import backends, monitor
 from vllm.compilation import wrapper as wrapper_module
+from vllm.compilation.counter import compilation_counter
 from vllm.config import CompilationMode, get_current_vllm_config
 from vllm.forward_context import (
     get_forward_context,
     is_forward_context_available,
 )
+from vllm.logger import init_logger
 
 from netrsn_turbo.turbo.version_0251.vllm_ascend.lora.punica_npu import (
     specialize_lora,
     validate_config,
 )
+
+logger = init_logger(__name__)
+
+AOT_LORA = "lora"
+AOT_BASE = "base"
+AOT_BASE_ONE = "base_one"
+AOT_VARIANTS = (AOT_LORA, AOT_BASE, AOT_BASE_ONE)
 
 
 def clone_forward(self, suffix):
@@ -57,13 +67,174 @@ def compile_base_variant(self, prefix, suffix):
         options["guard_filter_fn"] = torch.compiler.skip_all_guards_unsafe
     else:
         options["guard_filter_fn"] = lambda entries: [False for _ in entries]
-    return torch.compile(
-        clone_forward(self, suffix),
-        fullgraph=True,
-        dynamic=False,
-        backend=backend,
-        options=options,
+    aot_context = nullcontext()
+    if vllm_envs.VLLM_USE_AOT_COMPILE and hasattr(
+        torch._dynamo.config,
+        "enable_aot_compile",
+    ):
+        aot_context = torch._dynamo.config.patch(enable_aot_compile=True)
+    with aot_context:
+        return torch.compile(
+            clone_forward(self, suffix),
+            fullgraph=True,
+            dynamic=False,
+            backend=backend,
+            options=options,
+        )
+
+
+def select_variant(self):
+    if self._ascend_has_lora():
+        return AOT_LORA
+    descriptor = (
+        get_forward_context().batch_descriptor
+        if is_forward_context_available()
+        else None
     )
+    return (
+        AOT_BASE_ONE
+        if descriptor is not None and descriptor.num_tokens == 1
+        else AOT_BASE
+    )
+
+
+def variant_callable(self, variant):
+    if variant == AOT_LORA:
+        return self._compiled_callable
+    if variant == AOT_BASE:
+        return self._ascend_base_callable
+    if variant == AOT_BASE_ONE:
+        return self._ascend_base_one_callable
+    raise ValueError(f"Unknown Qwen3.5 LoRA AOT variant: {variant}")
+
+
+def variant_aot_path(aot_compilation_path, variant):
+    return f"{aot_compilation_path}.{variant}"
+
+
+class AOTVariantDispatcher:
+    """Route calls to separately compiled base and LoRA AOT artifacts."""
+
+    def __init__(self):
+        self.artifacts = {}
+        self.dirty_variants = set()
+
+    def add_loaded(self, variant, artifact):
+        self.artifacts[variant] = artifact
+
+    def compile_variant(self, model, variant, args, kwargs):
+        if variant != AOT_BASE_ONE:
+            model._ascend_mark_variant_dynamic_inputs(variant, *args, **kwargs)
+        compiled_callable = variant_callable(model, variant)
+        if not hasattr(compiled_callable, "aot_compile"):
+            raise RuntimeError(
+                "AOT compile is unavailable for the Qwen3.5 LoRA "
+                f"{variant} callable"
+            )
+        self.artifacts[variant] = compiled_callable.aot_compile((args, kwargs))
+        self.dirty_variants.add(variant)
+
+    def save_dirty(self, model):
+        if vllm_envs.VLLM_DISABLE_COMPILE_CACHE:
+            return
+        cache_dir = getattr(model, "_aot_cache_dir", None)
+        aot_compilation_path = getattr(model, "_aot_compilation_path", None)
+        if cache_dir is None or aot_compilation_path is None:
+            raise RuntimeError("AOT cache paths were not initialized")
+        os.makedirs(cache_dir, exist_ok=True)
+        for variant in AOT_VARIANTS:
+            if variant not in self.dirty_variants:
+                continue
+            path = variant_aot_path(aot_compilation_path, variant)
+            tmp_file = f"{path}.{os.getpid()}.tmp"
+            try:
+                self.artifacts[variant].save_compiled_function(tmp_file)
+                os.replace(tmp_file, path)
+                self.dirty_variants.remove(variant)
+                compilation_counter.num_aot_artifacts_saved += 1
+                logger.info(
+                    "Saved Qwen3.5 LoRA %s AOT artifact to %s",
+                    variant,
+                    path,
+                )
+            except Exception as error:
+                logger.warning(
+                    "Unable to save Qwen3.5 LoRA %s AOT artifact to %s: %s",
+                    variant,
+                    path,
+                    error,
+                )
+                try:
+                    if os.path.exists(tmp_file):
+                        os.remove(tmp_file)
+                except OSError:
+                    logger.warning(
+                        "Unable to remove temporary AOT artifact %s",
+                        tmp_file,
+                    )
+
+    def __call__(self, model, *args, **kwargs):
+        variant = select_variant(model)
+        if variant not in self.artifacts:
+            with monitor.monitor_torch_compile(
+                model.vllm_config,
+                is_encoder=model._is_encoder,
+            ):
+                self.compile_variant(model, variant, args, kwargs)
+                compilation_counter.num_aot_compiles += 1
+            self.save_dirty(model)
+        return self.artifacts[variant](model, *args, **kwargs)
+
+
+def wrap_aot_compile(original):
+    @wraps(original)
+    def aot_compile(self, *args, **kwargs):
+        if not getattr(self, "_ascend_specialize_lora", False):
+            return original(self, *args, **kwargs)
+        dispatcher = getattr(self, "_ascend_preloaded_aot_dispatcher", None)
+        if dispatcher is None:
+            dispatcher = AOTVariantDispatcher()
+        else:
+            del self._ascend_preloaded_aot_dispatcher
+        variant = select_variant(self)
+        if variant not in dispatcher.artifacts:
+            dispatcher.compile_variant(self, variant, args, kwargs)
+        return dispatcher
+
+    return aot_compile
+
+
+def save_aot_compiled_function(self):
+    dispatcher = self.aot_compiled_fn
+    if not isinstance(dispatcher, AOTVariantDispatcher):
+        raise RuntimeError("Expected the Qwen3.5 LoRA AOT variant dispatcher")
+    dispatcher.save_dirty(self)
+
+
+def wrap_try_load_aot_compiled_fn(original):
+    @wraps(original)
+    def try_load_aot_compiled_fn(model, aot_compilation_path):
+        if not getattr(model, "_ascend_specialize_lora", False):
+            return original(model, aot_compilation_path)
+        dispatcher = AOTVariantDispatcher()
+        for variant in AOT_VARIANTS:
+            artifact = original(
+                model,
+                variant_aot_path(aot_compilation_path, variant),
+            )
+            if artifact is not None:
+                dispatcher.add_loaded(variant, artifact)
+        if not dispatcher.artifacts:
+            return None
+        model._aot_compilation_path = aot_compilation_path
+        model._aot_cache_dir = os.path.dirname(aot_compilation_path)
+        selected_variant = select_variant(model)
+        if selected_variant not in dispatcher.artifacts:
+            model._ascend_preloaded_aot_dispatcher = dispatcher
+            return None
+        return dispatcher
+
+    return try_load_aot_compiled_fn
 
 
 def wrap_init(original):
@@ -77,11 +248,6 @@ def wrap_init(original):
         )
         if enabled:
             validate_config(config)
-            if vllm_envs.VLLM_USE_AOT_COMPILE:
-                raise ValueError(
-                    "Qwen3.5 LoRA graph isolation does not support "
-                    "VLLM_USE_AOT_COMPILE=1"
-                )
             if config.compilation_config.mode != CompilationMode.VLLM_COMPILE:
                 raise ValueError(
                     "Qwen3.5 LoRA graph isolation requires CompilationMode.VLLM_COMPILE"
@@ -113,6 +279,7 @@ def wrap_init(original):
             return
         self._ascend_punica_wrappers = None
         self._ascend_base_dynamic_inputs_marked = False
+        self._ascend_aot_dynamic_variants_marked = set()
         self._ascend_base_callable = compile_base_variant(
             self,
             f"{compile_prefix}.base",
@@ -123,6 +290,11 @@ def wrap_init(original):
             f"{compile_prefix}.base_one",
             "ascend_base_one",
         )
+        if vllm_envs.VLLM_USE_AOT_COMPILE:
+            self.save_aot_compiled_function = MethodType(
+                save_aot_compiled_function,
+                self,
+            )
 
     return init
 
@@ -141,9 +313,12 @@ def has_lora(self):
     return True
 
 
-def mark_base_dynamic_inputs(self, *args, **kwargs):
+def mark_variant_dynamic_inputs(self, variant, *args, **kwargs):
+    if variant in self._ascend_aot_dynamic_variants_marked:
+        return
     dynamic_dims = getattr(self, "_dynamic_arg_dims", {})
     if not dynamic_dims:
+        self._ascend_aot_dynamic_variants_marked.add(variant)
         return
     bound = inspect.signature(self.__class__.forward).bind(
         self,
@@ -162,6 +337,7 @@ def mark_base_dynamic_inputs(self, *args, **kwargs):
                 tensor,
                 [dim + tensor.ndim if dim < 0 else dim for dim in dims],
             )
+    self._ascend_aot_dynamic_variants_marked.add(variant)
 
 
 def wrap_call(original):
@@ -169,21 +345,15 @@ def wrap_call(original):
     def call(self, *args, **kwargs):
         if not getattr(self, "_ascend_specialize_lora", False):
             return original(self, *args, **kwargs)
-        if self._ascend_has_lora():
-            callable_fn = self._compiled_callable
-        else:
-            descriptor = (
-                get_forward_context().batch_descriptor
-                if is_forward_context_available()
-                else None
+        variant = select_variant(self)
+        callable_fn = variant_callable(self, variant)
+        if variant == AOT_BASE and not self._ascend_base_dynamic_inputs_marked:
+            self._ascend_mark_variant_dynamic_inputs(
+                variant,
+                *args,
+                **kwargs,
             )
-            if descriptor is not None and descriptor.num_tokens == 1:
-                callable_fn = self._ascend_base_one_callable
-            else:
-                callable_fn = self._ascend_base_callable
-                if not self._ascend_base_dynamic_inputs_marked:
-                    self._ascend_mark_base_dynamic_inputs(*args, **kwargs)
-                    self._ascend_base_dynamic_inputs_marked = True
+            self._ascend_base_dynamic_inputs_marked = True
         context = (
             nullcontext()
             if self.first_compile or not self.evaluate_guards

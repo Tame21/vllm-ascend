@@ -69,6 +69,10 @@ spawn 子进程仍需通过工程已有的 `special_init.py` 重新导入。
 `weak_ref_workspaces`，使已导入的同对象引用同步传播。类方法和新增辅助方法
 直接安装在原类上。若任一 ACL graph 状态已经初始化则拒绝应用，避免丢失状态。
 
+设置 `VLLM_USE_AOT_COMPILE=1` 时，compile wrapper 会分别编译、加载并原子保存
+LoRA、Base 和单 token Base 三份 AOT 产物（`model.lora`、`model.base`、
+`model.base_one`）。缓存只命中部分变体时，其余变体会在首次使用时补编译并保存。
+
 ## 兼容性边界
 
 不要同时加载 vLLM Ascend 原生的

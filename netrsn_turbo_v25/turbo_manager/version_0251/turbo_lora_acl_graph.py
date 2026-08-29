@@ -6,6 +6,7 @@ import os
 
 
 def apply_lora_acl_graph_patch() -> None:
+    from vllm.compilation import decorators
     from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
     from vllm.v1.worker.gpu_model_runner import GPUModelRunner
     from vllm_ascend.compilation import acl_graph
@@ -73,9 +74,17 @@ def apply_lora_acl_graph_patch() -> None:
     TorchCompileWithNoGuardsWrapper.__call__ = wrapper_patch.wrap_call(
         TorchCompileWithNoGuardsWrapper.__call__
     )
+    TorchCompileWithNoGuardsWrapper.aot_compile = wrapper_patch.wrap_aot_compile(
+        TorchCompileWithNoGuardsWrapper.aot_compile
+    )
     TorchCompileWithNoGuardsWrapper._ascend_has_lora = wrapper_patch.has_lora
-    TorchCompileWithNoGuardsWrapper._ascend_mark_base_dynamic_inputs = (
-        wrapper_patch.mark_base_dynamic_inputs
+    TorchCompileWithNoGuardsWrapper._ascend_mark_variant_dynamic_inputs = (
+        wrapper_patch.mark_variant_dynamic_inputs
+    )
+    decorators._try_load_aot_compiled_fn = (
+        wrapper_patch.wrap_try_load_aot_compiled_fn(
+            decorators._try_load_aot_compiled_fn
+        )
     )
     GPUModelRunner.maybe_dummy_run_with_lora = (
         model_runner_patch.wrap_maybe_dummy_run_with_lora(
