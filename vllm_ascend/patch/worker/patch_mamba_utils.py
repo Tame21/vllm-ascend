@@ -15,7 +15,7 @@ from vllm.v1.worker.lora_model_runner_mixin import GPUInputBatch
 from vllm.v1.worker.mamba_utils import MambaCopyBuffers
 
 from vllm_ascend.ops.triton.batch_memcpy import batch_memcpy_kernel
-from vllm_ascend.ops.triton.mamba.postprocess import postprocess_mamba_fused_kernel
+from vllm_ascend.patch.worker.patch_mamba_postprocess_v25 import postprocess_mamba_fused_kernel
 from vllm_ascend.utils import is_310p
 
 
