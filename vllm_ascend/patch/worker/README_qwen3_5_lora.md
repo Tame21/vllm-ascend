@@ -45,10 +45,11 @@ tag `v0.25.1`, not a claim of upstream or NPU validation. The intended initial
 deployment is A2/A3, runner v1, dense Qwen3.5, language-model LoRA, rank <= 64,
 with optional MTP speculative decoding. MoE and 310P are outside this patch's
 scope. Non-MTP speculative decoding, runner v2, rank > 64, context parallelism,
-microbatching, sleep mode and fully sharded LoRA are rejected for matching
-deployments. Graph isolation also disables npugraph_ex automatically.
-Vision/connector adapters are outside the supported scope. The fallback can be
-slower than native kernels.
+microbatching and sleep mode are rejected for matching deployments. Graph
+isolation also disables npugraph_ex automatically. Fully sharded LoRA keeps
+the native vLLM tensor-parallel sharding and collective paths.
+Vision/connector adapters are outside the supported scope. The fallback can
+be slower than native kernels.
 
 Before deployment, compare eager and graph outputs for the base model and
 each adapter; alternate base/adapter requests at the same token count; test

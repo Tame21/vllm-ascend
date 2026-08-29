@@ -41,8 +41,6 @@ def validate_config(config):
     speculative_config = config.speculative_config
     if speculative_config is not None and speculative_config.method != "mtp":
         raise ValueError("The Qwen3.5 LoRA patch supports MTP speculative decoding only")
-    if config.lora_config.fully_sharded_loras:
-        raise ValueError("The Qwen3.5 LoRA patch has not been validated with fully sharded LoRA")
     parallel = config.parallel_config
     if parallel.prefill_context_parallel_size > 1 or parallel.decode_context_parallel_size > 1:
         raise ValueError("The Qwen3.5 LoRA patch does not support context parallelism")
