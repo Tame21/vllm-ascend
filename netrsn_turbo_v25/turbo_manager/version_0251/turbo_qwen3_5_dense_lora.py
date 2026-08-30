@@ -5,9 +5,7 @@
 import os
 
 
-def apply_qwen3_5_dense_lora_patch() -> None:
-    # Resolve the real classes first so repeated/native installs can return
-    # before the custom operator in the implementation module is registered.
+def _get_patch_targets():
     from vllm.lora.model_manager import LoRAModelManager
     from vllm.lora.worker_manager import WorkerLoRAManager
     from vllm_ascend.attention.attention_v1 import (
@@ -15,8 +13,17 @@ def apply_qwen3_5_dense_lora_patch() -> None:
     )
     from vllm_ascend.lora.punica_npu import PunicaWrapperNPU
 
+    return (
+        LoRAModelManager,
+        WorkerLoRAManager,
+        AscendAttentionBackendImpl,
+        PunicaWrapperNPU,
+    )
+
+
+def _patch_can_be_installed(PunicaWrapperNPU) -> bool:
     if getattr(PunicaWrapperNPU, "_ascend_qwen3_5_patch_installed", False):
-        return
+        return False
     if getattr(
         PunicaWrapperNPU,
         "_external_qwen3_5_dense_lora_patch",
@@ -26,7 +33,11 @@ def apply_qwen3_5_dense_lora_patch() -> None:
             "Remove the external v0.23 Qwen3.5 LoRA patch before using "
             "the v0.25.1 TurboManager patch"
         )
+    return True
 
+
+def _get_patch_modules():
+    # Import after the state check because punica_npu registers a custom op.
     from netrsn_turbo.turbo.version_0251.vllm.lora import (
         model_manager as model_manager_patch,
     )
@@ -40,6 +51,15 @@ def apply_qwen3_5_dense_lora_patch() -> None:
         punica_npu as punica_patch,
     )
 
+    return (
+        model_manager_patch,
+        worker_manager_patch,
+        attention_patch,
+        punica_patch,
+    )
+
+
+def _patch_punica_wrapper(PunicaWrapperNPU, punica_patch):
     PunicaWrapperNPU._expand_slice_prefill = punica_patch.wrap_expand_slice(
         PunicaWrapperNPU._expand_slice_prefill
     )
@@ -49,29 +69,57 @@ def apply_qwen3_5_dense_lora_patch() -> None:
     PunicaWrapperNPU.update_metadata = punica_patch.wrap_update_metadata(
         PunicaWrapperNPU.update_metadata
     )
-    for name in (
+    guarded_methods = (
         "add_shrink",
         "add_expand",
         "add_lora_embedding",
         "add_lora_linear",
         "add_lora_logits",
-    ):
-        setattr(
-            PunicaWrapperNPU,
-            name,
-            punica_patch.no_lora_guard(getattr(PunicaWrapperNPU, name)),
-        )
+    )
+    for name in guarded_methods:
+        original = getattr(PunicaWrapperNPU, name)
+        setattr(PunicaWrapperNPU, name, punica_patch.no_lora_guard(original))
 
-    LoRAModelManager.__init__ = model_manager_patch.wrap_init(LoRAModelManager.__init__)
+
+def _patch_lora_managers(
+    LoRAModelManager,
+    WorkerLoRAManager,
+    model_manager_patch,
+    worker_manager_patch,
+):
+    LoRAModelManager.__init__ = model_manager_patch.wrap_init(
+        LoRAModelManager.__init__
+    )
     WorkerLoRAManager._load_adapter = worker_manager_patch.wrap_load_adapter(
         WorkerLoRAManager._load_adapter
     )
-    AscendAttentionBackendImpl.update_graph_params = staticmethod(
-        attention_patch.wrap_update_graph_params(
-            AscendAttentionBackendImpl.update_graph_params
-        )
+
+
+def _patch_attention_backend(AscendAttentionBackendImpl, attention_patch):
+    wrapped = attention_patch.wrap_update_graph_params(
+        AscendAttentionBackendImpl.update_graph_params
     )
-    PunicaWrapperNPU._ascend_qwen3_5_patch_installed = True
+    AscendAttentionBackendImpl.update_graph_params = staticmethod(wrapped)
+
+
+def apply_qwen3_5_dense_lora_patch() -> None:
+    # Resolve real classes before importing the custom-op implementation.
+    targets = _get_patch_targets()
+    model_manager, worker_manager, attention_backend, punica_wrapper = targets
+    if not _patch_can_be_installed(punica_wrapper):
+        return
+
+    patches = _get_patch_modules()
+    model_patch, worker_patch, attention_patch, punica_patch = patches
+    _patch_punica_wrapper(punica_wrapper, punica_patch)
+    _patch_lora_managers(
+        model_manager,
+        worker_manager,
+        model_patch,
+        worker_patch,
+    )
+    _patch_attention_backend(attention_backend, attention_patch)
+    punica_wrapper._ascend_qwen3_5_patch_installed = True
 
 
 if os.getenv("ADAPTATION_PKG_ID", ""):

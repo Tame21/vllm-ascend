@@ -237,64 +237,71 @@ def wrap_try_load_aot_compiled_fn(original):
     return try_load_aot_compiled_fn
 
 
+def lora_compile_enabled(config, is_encoder):
+    return (
+        specialize_lora(config)
+        and backends.model_tag == "backbone"
+        and not is_encoder
+    )
+
+
+def validate_lora_compile_config(config):
+    validate_config(config)
+    if config.compilation_config.mode != CompilationMode.VLLM_COMPILE:
+        raise ValueError(
+            "Qwen3.5 LoRA graph isolation requires CompilationMode.VLLM_COMPILE"
+        )
+    if config.compilation_config.dynamic_shapes_config.evaluate_guards:
+        raise ValueError(
+            "Qwen3.5 LoRA graph isolation requires "
+            "dynamic_shapes_config.evaluate_guards=false"
+        )
+
+
+def call_original_init(original, self, compile_prefix, is_encoder, enabled):
+    if not enabled:
+        original(self, compile_prefix=compile_prefix, is_encoder=is_encoder)
+        return
+    previous_bytecode_hook = vllm_envs.VLLM_USE_BYTECODE_HOOK
+    vllm_envs.VLLM_USE_BYTECODE_HOOK = False
+    try:
+        original(self, compile_prefix=compile_prefix, is_encoder=is_encoder)
+    finally:
+        vllm_envs.VLLM_USE_BYTECODE_HOOK = previous_bytecode_hook
+
+
+def initialize_lora_variants(self, compile_prefix):
+    self._ascend_punica_wrappers = None
+    self._ascend_base_dynamic_inputs_marked = False
+    self._ascend_aot_dynamic_variants_marked = set()
+    self._ascend_base_callable = compile_base_variant(
+        self,
+        f"{compile_prefix}.base",
+        "ascend_base",
+    )
+    self._ascend_base_one_callable = compile_base_variant(
+        self,
+        f"{compile_prefix}.base_one",
+        "ascend_base_one",
+    )
+    if vllm_envs.VLLM_USE_AOT_COMPILE:
+        self.save_aot_compiled_function = MethodType(
+            save_aot_compiled_function,
+            self,
+        )
+
+
 def wrap_init(original):
     @wraps(original)
     def init(self, compile_prefix="", is_encoder=False):
         config = get_current_vllm_config()
-        enabled = (
-            specialize_lora(config)
-            and backends.model_tag == "backbone"
-            and not is_encoder
-        )
+        enabled = lora_compile_enabled(config, is_encoder)
         if enabled:
-            validate_config(config)
-            if config.compilation_config.mode != CompilationMode.VLLM_COMPILE:
-                raise ValueError(
-                    "Qwen3.5 LoRA graph isolation requires CompilationMode.VLLM_COMPILE"
-                )
-            if config.compilation_config.dynamic_shapes_config.evaluate_guards:
-                raise ValueError(
-                    "Qwen3.5 LoRA graph isolation requires "
-                    "dynamic_shapes_config.evaluate_guards=false"
-                )
-        if enabled:
-            previous_bytecode_hook = vllm_envs.VLLM_USE_BYTECODE_HOOK
-            vllm_envs.VLLM_USE_BYTECODE_HOOK = False
-            try:
-                original(
-                    self,
-                    compile_prefix=compile_prefix,
-                    is_encoder=is_encoder,
-                )
-            finally:
-                vllm_envs.VLLM_USE_BYTECODE_HOOK = previous_bytecode_hook
-        else:
-            original(
-                self,
-                compile_prefix=compile_prefix,
-                is_encoder=is_encoder,
-            )
+            validate_lora_compile_config(config)
+        call_original_init(original, self, compile_prefix, is_encoder, enabled)
         self._ascend_specialize_lora = enabled
-        if not enabled:
-            return
-        self._ascend_punica_wrappers = None
-        self._ascend_base_dynamic_inputs_marked = False
-        self._ascend_aot_dynamic_variants_marked = set()
-        self._ascend_base_callable = compile_base_variant(
-            self,
-            f"{compile_prefix}.base",
-            "ascend_base",
-        )
-        self._ascend_base_one_callable = compile_base_variant(
-            self,
-            f"{compile_prefix}.base_one",
-            "ascend_base_one",
-        )
-        if vllm_envs.VLLM_USE_AOT_COMPILE:
-            self.save_aot_compiled_function = MethodType(
-                save_aot_compiled_function,
-                self,
-            )
+        if enabled:
+            initialize_lora_variants(self, compile_prefix)
 
     return init
 
