@@ -37,7 +37,6 @@ def _patch_can_be_installed(PunicaWrapperNPU) -> bool:
 
 
 def _get_patch_modules():
-    # Import after the state check because punica_npu registers a custom op.
     from netrsn_turbo.turbo.version_0251.vllm.lora import (
         model_manager as model_manager_patch,
     )
@@ -61,12 +60,6 @@ def _get_patch_modules():
 
 def _patch_punica_wrapper(PunicaWrapperNPU, punica_patch):
     PunicaWrapperNPU.__init__ = punica_patch.wrap_init(PunicaWrapperNPU.__init__)
-    PunicaWrapperNPU._expand_slice_prefill = punica_patch.wrap_expand_slice(
-        PunicaWrapperNPU._expand_slice_prefill
-    )
-    PunicaWrapperNPU._expand_slice_decode = punica_patch.wrap_expand_slice(
-        PunicaWrapperNPU._expand_slice_decode
-    )
     PunicaWrapperNPU.update_metadata = punica_patch.wrap_update_metadata(
         PunicaWrapperNPU.update_metadata
     )
@@ -104,7 +97,6 @@ def _patch_attention_backend(AscendAttentionBackendImpl, attention_patch):
 
 
 def apply_qwen3_5_dense_lora_patch() -> None:
-    # Resolve real classes before importing the custom-op implementation.
     targets = _get_patch_targets()
     model_manager, worker_manager, attention_backend, punica_wrapper = targets
     if not _patch_can_be_installed(punica_wrapper):

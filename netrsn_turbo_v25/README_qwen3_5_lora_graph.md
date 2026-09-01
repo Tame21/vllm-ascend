@@ -46,19 +46,21 @@ spawn 子进程仍需通过工程已有的 `special_init.py` 重新导入。
 
 | 原补丁目标 | Turbo 实现位置 |
 | --- | --- |
-| `PunicaWrapperNPU` 的 expand、metadata 与 no-LoRA guard | `turbo/version_0251/vllm_ascend/lora/punica_npu.py` |
+| `PunicaWrapperNPU` 的 shrink padding、metadata 与 no-LoRA guard | `turbo/version_0251/vllm_ascend/lora/punica_npu.py` |
 | `LoRAModelManager.__init__` 与多模态模块映射 | `turbo/version_0251/vllm/lora/model_manager.py` |
 | `WorkerLoRAManager._load_adapter` | `turbo/version_0251/vllm/lora/worker_manager.py` |
 | `AscendAttentionBackendImpl.update_graph_params` | `turbo/version_0251/vllm_ascend/attention/attention_v1.py` |
 
 管理入口
 `turbo_manager/version_0251/turbo_qwen3_5_dense_lora.py` 在原类上包装方法，
-并显式使用 `staticmethod` 保留 attention 方法的描述符。自定义 LoRA expand
-算子、分块临时张量、MM key remap、decode `no_lora` 更新和配置限制均保留。
-同时回补社区 #11940 的 shrink CopyOut 对齐兼容：旧 AscendC 内核要求 FP32
-输出 rank 按 8 个元素（32 bytes）对齐；Python 包装仅对该旧内核将权重和输出
-临时 padding 到 8 的倍数，执行后裁回逻辑 rank。PyTorch-native 后端和已对齐
-rank 不增加额外操作，fully-sharded TP 的本地 rank 也不会改变 all-gather 语义。
+并显式使用 `staticmethod` 保留 attention 方法的描述符。LoRA expand 直接使用
+vLLM Ascend 的 `sgmv_expand_slice`/`bgmv_expand_slice` 原生算子，避免逐 token
+PyTorch 实现的性能损耗；MM key remap、decode `no_lora` 更新和配置限制均保留。
+同时回补社区 #11940 的 rank 对齐兼容：旧 AscendC 内核要求 FP32 shrink/expand
+中间维按 8 个元素（32 bytes）对齐。Python 包装仅对该旧内核在调用原生算子前
+padding；shrink 执行后裁回逻辑 rank，确保 fully-sharded TP 的 all-gather 排列不变，
+expand 则同步 padding 输入和 LoRA-B 的 rank 维。PyTorch-native 后端和已对齐 rank
+不增加额外操作。
 
 ## LoRA ACL graph 映射
 

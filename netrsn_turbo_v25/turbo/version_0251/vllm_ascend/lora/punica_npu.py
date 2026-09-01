@@ -4,12 +4,11 @@
 
 from functools import wraps
 
-import torch
 import torch.nn.functional as F
 from vllm.config import CUDAGraphMode
 
-_DIRECT_SHRINK_MODULE = "vllm_ascend.lora.lora_ops"
-_SHRINK_RANK_ALIGNMENT = 8
+_DIRECT_LORA_OPS_MODULE = "vllm_ascend.lora.lora_ops"
+_LORA_RANK_ALIGNMENT = 8
 
 
 def patch_applies(config) -> bool:
@@ -61,18 +60,18 @@ def validate_config(config) -> None:
         )
 
 
-def pad_shrink_rank(rank):
-    """Pad FP32 shrink output to the AscendC 32-byte copy alignment."""
-    return (
-        (rank + _SHRINK_RANK_ALIGNMENT - 1) // _SHRINK_RANK_ALIGNMENT
-    ) * _SHRINK_RANK_ALIGNMENT
+def pad_lora_rank(rank):
+    """Align the FP32 shrink/expand dimension to an AscendC data block."""
+    return ((rank + _LORA_RANK_ALIGNMENT - 1) // _LORA_RANK_ALIGNMENT) * (
+        _LORA_RANK_ALIGNMENT
+    )
 
 
 def wrap_shrink_with_padding(original):
     @wraps(original)
     def shrink(inputs, weights, output, *args, **kwargs):
         rank = output.shape[-1]
-        padded_rank = pad_shrink_rank(rank)
+        padded_rank = pad_lora_rank(rank)
         if padded_rank == rank:
             return original(inputs, weights, output, *args, **kwargs)
 
@@ -95,101 +94,47 @@ def wrap_shrink_with_padding(original):
     return shrink
 
 
+def wrap_expand_with_padding(original):
+    """Align the FP32 shrink result and LoRA-B rank for AscendC expand."""
+
+    @wraps(original)
+    def expand(inputs, weights, output, *args, **kwargs):
+        rank = weights.shape[-1]
+        padded_rank = pad_lora_rank(rank)
+        if padded_rank == rank:
+            return original(inputs, weights, output, *args, **kwargs)
+        if inputs.shape[-1] < rank:
+            raise ValueError("LoRA expand input rank is smaller than LoRA-B rank")
+
+        rank_padding = padded_rank - rank
+        padded_inputs = F.pad(inputs[..., :rank], (0, rank_padding))
+        padded_weights = F.pad(weights, (0, rank_padding))
+        return original(
+            padded_inputs,
+            padded_weights,
+            output,
+            *args,
+            **kwargs,
+        )
+
+    return expand
+
+
 def wrap_init(original):
     @wraps(original)
     def init(self, *args, **kwargs):
         original(self, *args, **kwargs)
         shrink_module = getattr(self.bgmv_shrink, "__module__", "")
-        if shrink_module != _DIRECT_SHRINK_MODULE:
+        if shrink_module != _DIRECT_LORA_OPS_MODULE:
             return
         self.bgmv_shrink = wrap_shrink_with_padding(self.bgmv_shrink)
         self.sgmv_shrink = wrap_shrink_with_padding(self.sgmv_shrink)
+        self.bgmv_expand = wrap_expand_with_padding(self.bgmv_expand)
+        self.bgmv_expand_slice = wrap_expand_with_padding(self.bgmv_expand_slice)
+        self.sgmv_expand = wrap_expand_with_padding(self.sgmv_expand)
+        self.sgmv_expand_slice = wrap_expand_with_padding(self.sgmv_expand_slice)
 
     return init
-
-
-@torch.library.custom_op(
-    "vllm_ascend::qwen3_5_lora_expand_slice",
-    mutates_args={"y"},
-)
-def _lora_expand_slice(
-    y: torch.Tensor,
-    x: torch.Tensor,
-    weights: torch.Tensor,
-    indices: torch.Tensor,
-    offset: int,
-    width: int,
-    add_inputs: bool,
-) -> None:
-    rows_per_chunk = 128
-    rank = weights.shape[-1]
-    if rank > x.shape[-1] or weights.shape[-2] != width:
-        raise ValueError("Incompatible Qwen3.5 LoRA-B slice shape")
-    for start in range(0, x.shape[0], rows_per_chunk):
-        end = min(start + rows_per_chunk, x.shape[0])
-        token_indices = indices[start:end]
-        selected = weights[token_indices.clamp(min=0).long(), 0].to(y.dtype)
-        inputs = x[start:end, :rank].to(y.dtype)
-        delta = (inputs.unsqueeze(1) * selected).sum(dim=-1)
-        delta = torch.where(
-            (token_indices >= 0).unsqueeze(-1),
-            delta,
-            torch.zeros_like(delta),
-        )
-        target = y[start:end, offset : offset + width]
-        if add_inputs:
-            target.add_(delta)
-        else:
-            target.copy_(delta)
-
-
-@_lora_expand_slice.register_fake
-def _lora_expand_slice_fake(
-    y,
-    x,
-    weights,
-    indices,
-    offset,
-    width,
-    add_inputs,
-) -> None:
-    return None
-
-
-def wrap_expand_slice(original):
-    @wraps(original)
-    def expand(
-        self,
-        y,
-        x,
-        w_t_all,
-        y_offset,
-        y_slice_size,
-        add_inputs,
-    ):
-        if not getattr(self, "_ascend_qwen3_5_lora", False):
-            return original(
-                self,
-                y,
-                x,
-                w_t_all,
-                y_offset,
-                y_slice_size,
-                add_inputs,
-            )
-        if getattr(self, "_ascend_specialize_lora", False) and self.no_lora:
-            return None
-        _lora_expand_slice(
-            y,
-            x,
-            w_t_all,
-            self._get_token_lora_indices(x),
-            y_offset,
-            y_slice_size,
-            add_inputs,
-        )
-
-    return expand
 
 
 def wrap_update_metadata(original):
