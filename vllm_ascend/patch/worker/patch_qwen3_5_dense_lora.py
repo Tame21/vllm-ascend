@@ -4,7 +4,7 @@
 from copy import copy
 from functools import wraps
 
-import torch
+import torch.nn.functional as F
 from vllm.config import CUDAGraphMode
 from vllm.lora.model_manager import LoRAModelManager
 from vllm.lora.worker_manager import WorkerLoRAManager
@@ -13,6 +13,11 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
 from vllm_ascend.attention.utils import using_paged_attention
 from vllm_ascend.lora.punica_npu import PunicaWrapperNPU
+
+_DIRECT_LORA_OPS_MODULE = "vllm_ascend.lora.lora_ops"
+_LORA_RANK_ALIGNMENT = 8
+_SUPPORTED_CONFIG_RANKS = frozenset((1, 8, 16, 32, 64))
+_SUPPORTED_EXPAND_RANKS = frozenset((8, 16, 32, 64))
 
 
 def patch_applies(config) -> bool:
@@ -36,8 +41,8 @@ def validate_config(config):
         return
     if config.use_v2_model_runner:
         raise ValueError("The Qwen3.5 LoRA patch supports model runner v1 only")
-    if config.lora_config.max_lora_rank > 64:
-        raise ValueError("The Qwen3.5 LoRA patch currently supports max_lora_rank <= 64 only")
+    if config.lora_config.max_lora_rank not in _SUPPORTED_CONFIG_RANKS:
+        raise ValueError("The Qwen3.5 LoRA patch supports max_lora_rank 1, 8, 16, 32, or 64 only")
     speculative_config = config.speculative_config
     if speculative_config is not None and speculative_config.method != "mtp":
         raise ValueError("The Qwen3.5 LoRA patch supports MTP speculative decoding only")
@@ -50,50 +55,62 @@ def validate_config(config):
         raise ValueError("The Qwen3.5 LoRA patch has not been validated with sleep mode")
 
 
-@torch.library.custom_op("vllm_ascend::qwen3_5_lora_expand_slice", mutates_args={"y"})
-def _lora_expand_slice(
-    y: torch.Tensor,
-    x: torch.Tensor,
-    weights: torch.Tensor,
-    indices: torch.Tensor,
-    offset: int,
-    width: int,
-    add_inputs: bool,
-) -> None:
-    # Bound the gathered [tokens, output_width, rank] temporary for prefill.
-    rows_per_chunk = 128
-    rank = weights.shape[-1]
-    if rank > x.shape[-1] or weights.shape[-2] != width:
-        raise ValueError("Incompatible Qwen3.5 LoRA-B slice shape")
-    for start in range(0, x.shape[0], rows_per_chunk):
-        end = min(start + rows_per_chunk, x.shape[0])
-        token_indices = indices[start:end]
-        selected = weights[token_indices.clamp(min=0).long(), 0].to(y.dtype)
-        inputs = x[start:end, :rank].to(y.dtype)
-        delta = (inputs.unsqueeze(1) * selected).sum(dim=-1)
-        delta = torch.where((token_indices >= 0).unsqueeze(-1), delta, torch.zeros_like(delta))
-        target = y[start:end, offset : offset + width]
-        if add_inputs:
-            target.add_(delta)
-        else:
-            target.copy_(delta)
+def _pad_lora_rank(rank):
+    return ((rank + _LORA_RANK_ALIGNMENT - 1) // _LORA_RANK_ALIGNMENT) * _LORA_RANK_ALIGNMENT
 
 
-@_lora_expand_slice.register_fake
-def _lora_expand_slice_fake(y, x, weights, indices, offset, width, add_inputs) -> None:
-    return None
-
-
-def _wrap_expand_slice(original):
+def _wrap_shrink_with_padding(original):
     @wraps(original)
-    def expand(self, y, x, w_t_all, y_offset, y_slice_size, add_inputs):
-        if not getattr(self, "_ascend_qwen3_5_lora", False):
-            return original(self, y, x, w_t_all, y_offset, y_slice_size, add_inputs)
-        if getattr(self, "_ascend_specialize_lora", False) and self.no_lora:
-            return None
-        _lora_expand_slice(y, x, w_t_all, self._get_token_lora_indices(x), y_offset, y_slice_size, add_inputs)
+    def shrink(inputs, weights, output, *args, **kwargs):
+        rank = output.shape[-1]
+        if weights.shape[-2] != rank:
+            raise ValueError("LoRA shrink output rank must match LoRA-A rank")
+        padded_rank = _pad_lora_rank(rank)
+        if padded_rank == rank:
+            return original(inputs, weights, output, *args, **kwargs)
+
+        rank_padding = padded_rank - rank
+        padded_output = F.pad(output, (0, rank_padding))
+        padded_weights = F.pad(weights, (0, 0, 0, rank_padding))
+        result = original(inputs, padded_weights, padded_output, *args, **kwargs)
+        output.copy_(padded_output[..., :rank])
+        return result
+
+    return shrink
+
+
+def _wrap_expand_with_padding(original):
+    @wraps(original)
+    def expand(inputs, weights, output, *args, **kwargs):
+        rank = weights.shape[-1]
+        if inputs.shape[-1] != rank:
+            raise ValueError("LoRA expand input rank must match LoRA-B rank")
+        padded_rank = _pad_lora_rank(rank)
+        if padded_rank not in _SUPPORTED_EXPAND_RANKS:
+            raise ValueError(f"Unsupported AscendC LoRA expand rank: {padded_rank}")
+        if padded_rank == rank:
+            return original(inputs, weights, output, *args, **kwargs)
+
+        rank_padding = padded_rank - rank
+        padded_inputs = F.pad(inputs, (0, rank_padding))
+        padded_weights = F.pad(weights, (0, rank_padding))
+        return original(padded_inputs, padded_weights, output, *args, **kwargs)
 
     return expand
+
+
+def _install_rank_padding(wrapper):
+    if getattr(wrapper, "_ascend_lora_rank_padding_installed", False):
+        return
+    if getattr(wrapper.bgmv_shrink, "__module__", "") != _DIRECT_LORA_OPS_MODULE:
+        return
+    wrapper.bgmv_shrink = _wrap_shrink_with_padding(wrapper.bgmv_shrink)
+    wrapper.sgmv_shrink = _wrap_shrink_with_padding(wrapper.sgmv_shrink)
+    wrapper.bgmv_expand = _wrap_expand_with_padding(wrapper.bgmv_expand)
+    wrapper.bgmv_expand_slice = _wrap_expand_with_padding(wrapper.bgmv_expand_slice)
+    wrapper.sgmv_expand = _wrap_expand_with_padding(wrapper.sgmv_expand)
+    wrapper.sgmv_expand_slice = _wrap_expand_with_padding(wrapper.sgmv_expand_slice)
+    wrapper._ascend_lora_rank_padding_installed = True
 
 
 def _module_candidates(key, packed_modules_mapping):
@@ -148,6 +165,7 @@ def _manager_init(self, model, max_num_seqs, max_num_batched_tokens, vocab_size,
         wrapper = self.punica_wrapper_mapping[prefix]
         wrapper._ascend_qwen3_5_lora = True
         wrapper._ascend_specialize_lora = specialize_lora(vllm_config)
+        _install_rank_padding(wrapper)
 
 
 @wraps(_ORIGINAL_LOAD_ADAPTER)
@@ -213,8 +231,6 @@ def _install():
         return
     if getattr(PunicaWrapperNPU, "_external_qwen3_5_dense_lora_patch", False):
         raise RuntimeError("Remove the external v0.23 Qwen3.5 LoRA patch before using this patch")
-    PunicaWrapperNPU._expand_slice_prefill = _wrap_expand_slice(PunicaWrapperNPU._expand_slice_prefill)
-    PunicaWrapperNPU._expand_slice_decode = _wrap_expand_slice(PunicaWrapperNPU._expand_slice_decode)
     PunicaWrapperNPU.update_metadata = _update_metadata
     for name in ("add_shrink", "add_expand", "add_lora_embedding", "add_lora_linear", "add_lora_logits"):
         setattr(PunicaWrapperNPU, name, _no_lora_guard(getattr(PunicaWrapperNPU, name)))

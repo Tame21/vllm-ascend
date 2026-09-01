@@ -27,16 +27,18 @@ call is needed.
 
 ## What changes
 
-- `patch_qwen3_5_dense_lora.py`: uses a bounded, masked PyTorch fallback for
-  language-model LoRA-B slices; adds language prefixes only when they resolve
-  to an actual module; refreshes `no_lora` from CPU mapping data; filters GDN
-  metadata out of target FIA replay without changing the shared context.
+- `patch_qwen3_5_dense_lora.py`: preserves the native AscendC LoRA
+  shrink/expand kernels and pads only unaligned rank dimensions at their call
+  boundary; adds language prefixes only when they resolve to an actual module;
+  refreshes `no_lora` from CPU mapping data; filters GDN metadata out of target
+  FIA replay without changing the shared context.
 - `patch_lora_acl_graph.py`: compiles separate base and LoRA callables,
   separates FULL graph events/handles/workspaces/attention parameters by
   `BatchDescriptor`, and keeps dummy LoRA counts consistent with capture keys.
 
 The second module is inactive with `--enforce-eager` or no CUDA graph mode.
-The first module still provides LoRA-B and name/metadata fixes in eager mode.
+The first module still provides rank alignment and name/metadata fixes in eager
+mode.
 
 ## Scope and verification
 
@@ -48,8 +50,9 @@ scope. Non-MTP speculative decoding, runner v2, rank > 64, context parallelism,
 microbatching and sleep mode are rejected for matching deployments. Graph
 isolation also disables npugraph_ex automatically. Fully sharded LoRA keeps
 the native vLLM tensor-parallel sharding and collective paths.
-Vision/connector adapters are outside the supported scope. The fallback can
-be slower than native kernels.
+Vision/connector adapters are outside the supported scope. Aligned ranks call
+the native kernels directly; unaligned local ranks add only padding and crop
+operations around those kernels.
 
 Before deployment, compare eager and graph outputs for the base model and
 each adapter; alternate base/adapter requests at the same token count; test
