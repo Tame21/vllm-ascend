@@ -60,6 +60,7 @@ def _get_patch_modules():
 
 
 def _patch_punica_wrapper(PunicaWrapperNPU, punica_patch):
+    PunicaWrapperNPU.__init__ = punica_patch.wrap_init(PunicaWrapperNPU.__init__)
     PunicaWrapperNPU._expand_slice_prefill = punica_patch.wrap_expand_slice(
         PunicaWrapperNPU._expand_slice_prefill
     )

@@ -5,7 +5,11 @@
 from functools import wraps
 
 import torch
+import torch.nn.functional as F
 from vllm.config import CUDAGraphMode
+
+_DIRECT_SHRINK_MODULE = "vllm_ascend.lora.lora_ops"
+_SHRINK_RANK_ALIGNMENT = 8
 
 
 def patch_applies(config) -> bool:
@@ -55,6 +59,53 @@ def validate_config(config) -> None:
         raise ValueError(
             "The Qwen3.5 LoRA patch has not been validated with sleep mode"
         )
+
+
+def pad_shrink_rank(rank):
+    """Pad FP32 shrink output to the AscendC 32-byte copy alignment."""
+    return (
+        (rank + _SHRINK_RANK_ALIGNMENT - 1) // _SHRINK_RANK_ALIGNMENT
+    ) * _SHRINK_RANK_ALIGNMENT
+
+
+def wrap_shrink_with_padding(original):
+    @wraps(original)
+    def shrink(inputs, weights, output, *args, **kwargs):
+        rank = output.shape[-1]
+        padded_rank = pad_shrink_rank(rank)
+        if padded_rank == rank:
+            return original(inputs, weights, output, *args, **kwargs)
+
+        rank_padding = padded_rank - rank
+        padded_output = F.pad(output, (0, rank_padding))
+        padded_weights = F.pad(
+            weights,
+            (0, 0, 0, rank_padding),
+        )
+        result = original(
+            inputs,
+            padded_weights,
+            padded_output,
+            *args,
+            **kwargs,
+        )
+        output.copy_(padded_output[..., :rank])
+        return result
+
+    return shrink
+
+
+def wrap_init(original):
+    @wraps(original)
+    def init(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        shrink_module = getattr(self.bgmv_shrink, "__module__", "")
+        if shrink_module != _DIRECT_SHRINK_MODULE:
+            return
+        self.bgmv_shrink = wrap_shrink_with_padding(self.bgmv_shrink)
+        self.sgmv_shrink = wrap_shrink_with_padding(self.sgmv_shrink)
+
+    return init
 
 
 @torch.library.custom_op(

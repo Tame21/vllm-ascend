@@ -55,6 +55,10 @@ spawn 子进程仍需通过工程已有的 `special_init.py` 重新导入。
 `turbo_manager/version_0251/turbo_qwen3_5_dense_lora.py` 在原类上包装方法，
 并显式使用 `staticmethod` 保留 attention 方法的描述符。自定义 LoRA expand
 算子、分块临时张量、MM key remap、decode `no_lora` 更新和配置限制均保留。
+同时回补社区 #11940 的 shrink CopyOut 对齐兼容：旧 AscendC 内核要求 FP32
+输出 rank 按 8 个元素（32 bytes）对齐；Python 包装仅对该旧内核将权重和输出
+临时 padding 到 8 的倍数，执行后裁回逻辑 rank。PyTorch-native 后端和已对齐
+rank 不增加额外操作，fully-sharded TP 的本地 rank 也不会改变 all-gather 语义。
 
 ## LoRA ACL graph 映射
 
