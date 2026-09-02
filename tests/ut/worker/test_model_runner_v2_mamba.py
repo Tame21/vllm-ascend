@@ -139,7 +139,7 @@ def test_prepare_attn_marks_uniform_full_graph_padding_as_spec(mock_build_attn_m
     assert metadata is expected_metadata
     model_metadata = mock_build_attn_metadata.call_args.kwargs["model_specific_attn_metadata"]
     assert model_metadata.num_decode_draft_tokens_cpu.tolist() == [3, 3, 3, 3]
-    assert model_metadata.num_accepted_tokens.tolist() == [2, 3, 1, 1]
+    assert model_metadata.num_accepted_tokens.tolist() == [2, 3, 0, 0]
 
 
 @patch(

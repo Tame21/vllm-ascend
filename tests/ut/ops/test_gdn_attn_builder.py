@@ -548,6 +548,58 @@ def test_full_graph_spec_conv1d_args_keep_request_granularity():
     )
 
 
+def test_full_graph_spec_padding_does_not_write_null_state_block():
+    batch_spec = BatchSpec(
+        seq_lens=[4, 4, 0, 0],
+        query_lens=[4, 4, 4, 4],
+        name="full_graph_spec_padding_noop",
+    )
+    common_attn_metadata = create_common_attn_metadata(
+        batch_spec=batch_spec,
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+    common_attn_metadata.block_table_tensor = torch.tensor(
+        [
+            [10, 11, 12, 13],
+            [20, 21, 22, 23],
+            [NULL_BLOCK_ID] * 4,
+            [NULL_BLOCK_ID] * 4,
+        ],
+        dtype=torch.int32,
+    )
+    builder = _make_builder(
+        device=torch.device("cpu"),
+        num_heads=32,
+        num_speculative_tokens=3,
+        mamba_cache_mode="align",
+        num_speculative_blocks=3,
+        cudagraph_mode=CUDAGraphMode.FULL_DECODE_ONLY,
+    )
+
+    attn_metadata = builder.build(
+        0,
+        common_attn_metadata,
+        num_accepted_tokens=torch.tensor([2, 4, 0, 0], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=torch.tensor([3, 3, 3, 3], dtype=torch.int32),
+    )
+
+    spec_metadata = attn_metadata.spec_decode_metadata.spec_causal_conv1d
+    assert torch.equal(
+        spec_metadata.cache_indices,
+        torch.tensor(
+            [
+                [10, 11, 12, 13],
+                [20, 21, 22, 23],
+                [PAD_SLOT_ID] * 4,
+                [PAD_SLOT_ID] * 4,
+            ],
+            dtype=torch.int32,
+        ),
+    )
+    assert spec_metadata.num_accepted_tokens.tolist() == [2, 4, 0, 0]
+
+
 def test_full_graph_spec_actual_seq_lengths_use_padded_builder_buffer():
     batch_spec = BatchSpec(
         seq_lens=[4, 4],

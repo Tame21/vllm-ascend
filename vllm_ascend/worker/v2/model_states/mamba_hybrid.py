@@ -64,7 +64,11 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
         if not for_capture and self.vllm_config.num_speculative_tokens > 0:
-            num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
+            # Padded full-graph requests must keep the speculative graph shape,
+            # but they must not advance any persistent Mamba/GDN state. A real
+            # speculative request always accepts at least the bonus token, so
+            # zero is an unambiguous no-op marker for padded requests.
+            num_accepted_tokens = self.num_accepted_tokens_gpu.new_zeros(num_reqs)
             num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[input_batch.idx_mapping]
 
             num_decode_draft_tokens_np = np.full(num_reqs, -1, dtype=np.int32)

@@ -13,6 +13,7 @@ def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
     src_ptr = tl.load(src_ptrs + pid)
     dst_ptr = tl.load(dst_ptrs + pid)
     size = tl.load(sizes + pid)
+    is_left_overlap = dst_ptr < src_ptr and dst_ptr + size > src_ptr
 
     # We need to mv pointer_type cast outside the loop.
     # Otherwise it causes potential bugs.
@@ -28,4 +29,9 @@ def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
 
         # cache_modifier=".cg" bypasses L1 cache for streaming data.
         data = tl.load(curr_src_ptr, mask=mask, cache_modifier=".cg")
+        if is_left_overlap:
+            # Match memmove for same-buffer left shifts. Without a program-wide
+            # barrier one worker can overwrite bytes another worker has not
+            # loaded yet from the overlapping source range.
+            tl.debug_barrier()
         tl.store(curr_dst_ptr, data, mask=mask, cache_modifier=".cg")

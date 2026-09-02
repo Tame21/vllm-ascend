@@ -707,6 +707,18 @@ class AscendGDNAttentionMetadataBuilder(GDNAttentionMetadataBuilder):
                 0,
                 spec_sequence_indices,
             )
+            # Uniform full graphs represent padded request rows as speculative
+            # dummies so capture and replay retain the same topology. In align
+            # cache mode their gathered block IDs are NULL_BLOCK_ID (0), which
+            # is also the semantic all-zero state used by real requests at
+            # skipped alignment boundaries. Never let a dummy update that
+            # shared null state: accepted == 0 makes the recurrent update a
+            # no-op, while PAD_SLOT_ID makes causal-conv1d skip the row.
+            spec_state_indices_tensor = torch.where(
+                num_accepted_tokens[:, None] > 0,
+                spec_state_indices_tensor,
+                PAD_SLOT_ID,
+            )
 
         # A FULL graph retains captured speculative conv/recurrent tasks. Clear
         # their stable inputs on every no-spec replay so an idle or prefill

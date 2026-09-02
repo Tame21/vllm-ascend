@@ -3,6 +3,8 @@
 
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.ops.triton.mamba.copy import copy_overlapping_conv_state
+
 
 @triton.jit
 def _copy_mamba_state_block(
@@ -56,6 +58,22 @@ def _copy_mamba_state_block(
         per_row_bytes = (conv_width - token_bias).to(tl.int64) * state_elem_size
         bias_bytes = token_bias.to(tl.int64) * state_elem_size
         src_block_addr = state_base_addr + src_block_id * state_block_stride
+
+        if src_block_id == dest_block_id and token_bias > 0:
+            copy_overlapping_conv_state(
+                src_block_addr,
+                dst_addr,
+                token_bias,
+                conv_width,
+                state_inner_size,
+                state_elem_size,
+                dim_rows,
+                row_stride,
+                COPY_BLOCK_SIZE,
+                CONV_STATE_DIM_FIRST,
+            )
+            return
+
         offsets = tl.arange(0, COPY_BLOCK_SIZE)
 
         for row in range(0, dim_rows):
@@ -71,8 +89,25 @@ def _copy_mamba_state_block(
         if tile_idx > 0:
             return
         src_block_id = tl.load(block_table_base + src_col).to(tl.int64)
+        src_block_addr = state_base_addr + src_block_id * state_block_stride
+
+        if src_block_id == dest_block_id and token_bias > 0:
+            copy_overlapping_conv_state(
+                src_block_addr,
+                dst_addr,
+                token_bias,
+                conv_width,
+                state_inner_size,
+                state_elem_size,
+                0,
+                0,
+                COPY_BLOCK_SIZE,
+                CONV_STATE_DIM_FIRST,
+            )
+            return
+
         src_offset = token_bias.to(tl.int64) * state_inner_size * state_elem_size
-        src_addr = state_base_addr + src_block_id * state_block_stride + src_offset
+        src_addr = src_block_addr + src_offset
         copy_size = (conv_width - token_bias).to(tl.int64) * state_inner_size * state_elem_size
         offsets = tl.arange(0, COPY_BLOCK_SIZE)
         src_ptr = src_addr.to(tl.pointer_type(tl.uint8))

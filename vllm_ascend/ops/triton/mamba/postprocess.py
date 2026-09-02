@@ -4,6 +4,7 @@
 
 from vllm.triton_utils import tl, triton
 
+from vllm_ascend.ops.triton.mamba.copy import copy_overlapping_conv_state
 from vllm_ascend.utils import vllm_version_is
 
 if vllm_version_is("0.27.1"):
@@ -205,6 +206,20 @@ if vllm_version_is("0.27.1"):
             # (not earlier) so it stays in the same scope as the copy loop.
             dim_row_count = tl.load(state_dim_row_count_ptr + state_idx)
             dim_row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
+            if src_block_id == dest_block_id and accept_token_bias > 0:
+                copy_overlapping_conv_state(
+                    src_addr - src_offset,
+                    dst_addr,
+                    accept_token_bias,
+                    conv_width,
+                    state_inner_size,
+                    state_elem_size,
+                    dim_row_count,
+                    dim_row_stride,
+                    COPY_BLOCK_SIZE,
+                    CONV_STATE_DIM_FIRST,
+                )
+                return
             for row in range(dim_row_count):
                 row_src = (src_addr + row * dim_row_stride).to(tl.pointer_type(tl.uint8))
                 row_dst = (dst_addr + row * dim_row_stride).to(tl.pointer_type(tl.uint8))
@@ -212,8 +227,31 @@ if vllm_version_is("0.27.1"):
                     mask = (i + offsets) < copy_size
                     data = tl.load(row_src + i + offsets, mask=mask)
                     tl.store(row_dst + i + offsets, data, mask=mask)
+        elif is_conv_state:
+            if src_block_id == dest_block_id and accept_token_bias > 0:
+                copy_overlapping_conv_state(
+                    src_addr - src_offset,
+                    dst_addr,
+                    accept_token_bias,
+                    conv_width,
+                    state_inner_size,
+                    state_elem_size,
+                    0,
+                    0,
+                    COPY_BLOCK_SIZE,
+                    CONV_STATE_DIM_FIRST,
+                )
+                return
+
+            # Non-overlapping SD conv: single contiguous region.
+            src_ptr = src_addr.to(tl.pointer_type(tl.uint8))
+            dst_ptr = dst_addr.to(tl.pointer_type(tl.uint8))
+            for i in range(0, copy_size, COPY_BLOCK_SIZE):
+                mask = (i + offsets) < copy_size
+                data = tl.load(src_ptr + i + offsets, mask=mask)
+                tl.store(dst_ptr + i + offsets, data, mask=mask)
         else:
-            # SD conv / temporal: single contiguous region.
+            # Temporal state: single contiguous region.
             src_ptr = src_addr.to(tl.pointer_type(tl.uint8))
             dst_ptr = dst_addr.to(tl.pointer_type(tl.uint8))
             for i in range(0, copy_size, COPY_BLOCK_SIZE):
@@ -398,6 +436,21 @@ else:
         if CONV_STATE_DIM_FIRST and is_conv_state:
             dim_row_count = tl.load(state_dim_row_count_ptr + state_idx)
             dim_row_stride = tl.load(state_dim_row_stride_ptr + state_idx)
+            if src_block_id == dest_block_id and accept_token_bias > 0:
+                if tile_idx == 0:
+                    copy_overlapping_conv_state(
+                        src_addr - src_offset,
+                        dst_addr,
+                        accept_token_bias,
+                        conv_width,
+                        state_inner_size,
+                        state_elem_size,
+                        dim_row_count,
+                        dim_row_stride,
+                        COPY_BLOCK_SIZE,
+                        CONV_STATE_DIM_FIRST,
+                    )
+                return
             for row in range(dim_row_count):
                 row_src = (src_addr + row * dim_row_stride).to(tl.pointer_type(tl.uint8))
                 row_dst = (dst_addr + row * dim_row_stride).to(tl.pointer_type(tl.uint8))
@@ -412,10 +465,24 @@ else:
             if is_conv_state:
                 # SD conv is small; only tile 0 does the copy.
                 if tile_idx == 0:
-                    for i in range(0, copy_size, COPY_BLOCK_SIZE):
-                        mask = (i + offsets) < copy_size
-                        data = tl.load(src_ptr + i + offsets, mask=mask)
-                        tl.store(dst_ptr + i + offsets, data, mask=mask)
+                    if src_block_id == dest_block_id and accept_token_bias > 0:
+                        copy_overlapping_conv_state(
+                            src_addr - src_offset,
+                            dst_addr,
+                            accept_token_bias,
+                            conv_width,
+                            state_inner_size,
+                            state_elem_size,
+                            0,
+                            0,
+                            COPY_BLOCK_SIZE,
+                            CONV_STATE_DIM_FIRST,
+                        )
+                    else:
+                        for i in range(0, copy_size, COPY_BLOCK_SIZE):
+                            mask = (i + offsets) < copy_size
+                            data = tl.load(src_ptr + i + offsets, mask=mask)
+                            tl.store(dst_ptr + i + offsets, data, mask=mask)
             else:
                 # Temporal state: partition the copy range across TEMPORAL_TILES
                 # CTAs along the u64 inner range to keep SMs filled at small batch.
