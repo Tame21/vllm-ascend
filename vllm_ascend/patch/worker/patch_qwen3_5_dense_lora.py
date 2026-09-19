@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Qwen3.5 dense LoRA fixes for the vLLM 0.25.1 release lane."""
 
-from copy import copy
 from functools import wraps
 
 import torch
@@ -9,9 +8,6 @@ from vllm.config import CUDAGraphMode
 from vllm.lora.model_manager import LoRAModelManager
 from vllm.lora.worker_manager import WorkerLoRAManager
 
-from vllm_ascend.ascend_forward_context import _EXTRA_CTX
-from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
-from vllm_ascend.attention.utils import using_paged_attention
 from vllm_ascend.lora.punica_npu import PunicaWrapperNPU
 
 
@@ -130,7 +126,6 @@ def _remap_lora_keys(loras, module_names, packed_modules_mapping, language_prefi
 _ORIGINAL_MANAGER_INIT = LoRAModelManager.__init__
 _ORIGINAL_LOAD_ADAPTER = WorkerLoRAManager._load_adapter
 _ORIGINAL_UPDATE_METADATA = PunicaWrapperNPU.update_metadata
-_ORIGINAL_UPDATE_GRAPH_PARAMS = AscendAttentionBackendImpl.update_graph_params
 
 
 @wraps(_ORIGINAL_MANAGER_INIT)
@@ -181,33 +176,6 @@ def _no_lora_guard(original):
     return guarded
 
 
-def update_graph_params(
-    update_stream, forward_context, num_tokens, vllm_config, speculative_config=None, draft_attn_metadatas=None
-):
-    if (
-        patch_applies(vllm_config)
-        and not _EXTRA_CTX.is_draft_model
-        and not using_paged_attention(num_tokens, vllm_config)
-        and isinstance(forward_context.attn_metadata, dict)
-    ):
-        # Do not mutate the shared context: GDN still needs its own metadata.
-        filtered_context = copy(forward_context)
-        filtered_context.attn_metadata = {
-            key: metadata
-            for key, metadata in forward_context.attn_metadata.items()
-            if hasattr(metadata, "seq_lens_list") and hasattr(metadata, "actual_seq_lengths_q")
-        }
-        forward_context = filtered_context
-    return _ORIGINAL_UPDATE_GRAPH_PARAMS(
-        update_stream,
-        forward_context,
-        num_tokens,
-        vllm_config,
-        speculative_config,
-        draft_attn_metadatas=draft_attn_metadatas,
-    )
-
-
 def _install():
     if getattr(PunicaWrapperNPU, "_ascend_qwen3_5_patch_installed", False):
         return
@@ -220,7 +188,6 @@ def _install():
         setattr(PunicaWrapperNPU, name, _no_lora_guard(getattr(PunicaWrapperNPU, name)))
     LoRAModelManager.__init__ = _manager_init
     WorkerLoRAManager._load_adapter = _load_adapter
-    AscendAttentionBackendImpl.update_graph_params = staticmethod(update_graph_params)
     PunicaWrapperNPU._ascend_qwen3_5_patch_installed = True
 
 
