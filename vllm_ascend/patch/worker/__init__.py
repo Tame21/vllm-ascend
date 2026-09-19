@@ -51,6 +51,10 @@ import vllm_ascend.patch.worker.patch_kimi_k25  # noqa
 import vllm_ascend.patch.worker.patch_draft_quarot  # noqa
 import vllm_ascend.patch.worker.patch_eagle3_init  # noqa
 import vllm_ascend.patch.worker.patch_cudagraph  # noqa
+if vllm_version_is("0.25.1") and not is_310p():
+    import vllm_ascend.patch.worker.patch_qwen3_5_dense_lora  # noqa
+    import vllm_ascend.patch.worker.patch_lora_acl_graph  # noqa
+
 import vllm_ascend.patch.worker.patch_deepseek_mtp  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_v2  # noqa
 

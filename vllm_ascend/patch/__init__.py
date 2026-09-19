@@ -28,6 +28,14 @@
 
 # What's Patched and how it works:
 # --------------------------------
+# worker/patch_qwen3_5_dense_lora.py and worker/patch_lora_acl_graph.py:
+#   Qwen3.5 dense LoRA fixes plus graph/AOT isolation for Qwen3.5 and the
+#   Mistral3-based Magistral-Small-2509 on vLLM 0.25.1: aligned Qwen LoRA-A
+#   shrink, aligned native packed LoRA-B expansion, verified language-module
+#   prefix mapping, FIA-only replay metadata, separate base/LoRA compilation
+#   and AOT artifacts, and ACL graph params. See worker/README_qwen3_5_lora.md
+#   for supported configurations.
+#
 # * Platform Patch:
 # =================
 # Entries are listed in alphabetical order by file name.
