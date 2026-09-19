@@ -157,6 +157,25 @@ class LayerNormFn(torch.autograd.Function):
         return y.reshape(x_shape_og)
 
 
+@torch.library.custom_op("vllm_ascend::rms_norm_gated", mutates_args=())
+def _rms_norm_gated(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+    z: torch.Tensor | None,
+    eps: float,
+    group_size: int | None,
+    norm_before_gate: bool,
+) -> torch.Tensor:
+    # Keep process-local Triton kernel/constant indices out of serialized AOT graphs.
+    return LayerNormFn.apply(x, weight, bias, z, eps, group_size, norm_before_gate, True)
+
+
+@_rms_norm_gated.register_fake
+def _rms_norm_gated_fake(x, weight, bias, z, eps, group_size, norm_before_gate):
+    return torch.empty_like(x, memory_format=torch.contiguous_format)
+
+
 class AscendRMSNormGated(RMSNormGated):
     def __init__(
         self,
@@ -196,4 +215,4 @@ class AscendRMSNormGated(RMSNormGated):
 
     def forward_oot(self, x, z=None):
         """If z is not None, we do norm(x) * silu(z) if norm_before_gate, else norm(x * silu(z))"""
-        return LayerNormFn.apply(x, self.weight, self.bias, z, self.eps, self.group_size, self.norm_before_gate, True)
+        return _rms_norm_gated(x, self.weight, self.bias, z, self.eps, self.group_size, self.norm_before_gate)
