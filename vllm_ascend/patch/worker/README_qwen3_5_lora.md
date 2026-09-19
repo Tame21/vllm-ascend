@@ -41,7 +41,9 @@ call is needed.
 - `patch_qwen3_5_dense_lora.py`: pads non-block-aligned LoRA-A ranks and
   temporary shrink outputs, and pads narrow or unaligned packed LoRA-B slices
   and temporary expand outputs before invoking the native Ascend kernels. It
-  also adds language prefixes only when they resolve to an actual module.
+  also preserves missing `in_proj_qkvz` LoRA groups when unpacking a partial
+  adapter, and adds language prefixes only when they resolve to an actual
+  module.
 - `patch_lora_acl_graph.py`: compiles separate base and LoRA callables,
   separates FULL graph events/handles/workspaces/attention parameters by
   `BatchDescriptor`, keeps dummy LoRA counts consistent with capture keys,

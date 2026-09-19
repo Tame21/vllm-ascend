@@ -2,7 +2,7 @@
 
 from math import prod
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -49,6 +49,90 @@ def test_validate_config_accepts_deployed_ranks(rank):
 def test_validate_config_rejects_other_ranks():
     with pytest.raises(ValueError, match="max_lora_rank 8 or 16"):
         dense_lora.validate_config(_config(32))
+
+
+@pytest.mark.parametrize("missing_group", [0, 1])
+def test_qwen_qkvz_packed_lora_allows_missing_group(missing_group):
+    module = SimpleNamespace(
+        _ascend_qwen3_5_qkvz_lora=True,
+        n_slices=4,
+        output_sizes=(4, 4, 8, 8),
+    )
+    lora_a = [torch.ones(8, 16), torch.full((8, 16), 2.0)]
+    lora_b = [torch.arange(16 * 8).view(16, 8), torch.arange(8 * 8).view(8, 8)]
+    lora_a[missing_group] = None
+    lora_b[missing_group] = None
+
+    expanded_a, expanded_b = dense_lora._expand_packed_lora(module, lora_a, lora_b)
+
+    assert len(expanded_a) == len(expanded_b) == 4
+    start, end = (0, 3) if missing_group == 0 else (3, 4)
+    assert expanded_a[start:end] == [None] * (end - start)
+    assert expanded_b[start:end] == [None] * (end - start)
+    for index in range(4):
+        if start <= index < end:
+            continue
+        group_index = 0 if index < 3 else 1
+        assert expanded_a[index] is lora_a[group_index]
+        assert expanded_b[index].shape == (module.output_sizes[index], 8)
+    if missing_group == 1:
+        assert torch.equal(torch.cat(expanded_b[:3], dim=0), lora_b[0])
+    else:
+        assert torch.equal(expanded_b[3], lora_b[1])
+
+
+def test_qwen_qkvz_packed_lora_rejects_inconsistent_group_width():
+    module = SimpleNamespace(
+        _ascend_qwen3_5_qkvz_lora=True,
+        n_slices=4,
+        output_sizes=(4, 4, 8, 8),
+    )
+    lora_a = [torch.ones(8, 16), None]
+    lora_b = [torch.ones(15, 8), None]
+
+    with pytest.raises(ValueError, match="LoRA-B group width"):
+        dense_lora._expand_packed_lora(module, lora_a, lora_b)
+
+
+def test_qwen_qkvz_packed_lora_preserves_unrelated_modules():
+    module = SimpleNamespace(_ascend_qwen3_5_qkvz_lora=False)
+    lora_a, lora_b = [None], [None]
+    with patch.object(dense_lora, "_ORIGINAL_EXPAND_PACKED_LORA", return_value=(lora_a, lora_b)) as original:
+        result = dense_lora._expand_packed_lora(module, lora_a, lora_b)
+
+    assert result == (lora_a, lora_b)
+    original.assert_called_once_with(module, lora_a, lora_b)
+
+
+def test_manager_marks_only_qwen_qkvz_packed_layers():
+    class FakeMergedLayer:
+        pass
+
+    manager = SimpleNamespace()
+    qkvz_layer = FakeMergedLayer()
+    other_layer = FakeMergedLayer()
+    wrapper = SimpleNamespace()
+
+    def initialize_manager(*args):
+        manager.supports_mm = False
+        manager.punica_wrapper_mapping = {"language_model": wrapper}
+        manager.modules = {
+            "model.layers.0.linear_attn.in_proj_qkvz": qkvz_layer,
+            "model.layers.0.linear_attn.in_proj_ba": other_layer,
+        }
+
+    with (
+        patch.object(dense_lora, "MergedColumnParallelLinearWithLoRA", FakeMergedLayer),
+        patch.object(dense_lora, "patch_applies", return_value=True),
+        patch.object(dense_lora, "validate_config"),
+        patch.object(dense_lora, "specialize_lora", return_value=False),
+        patch.object(dense_lora, "_ORIGINAL_MANAGER_INIT", side_effect=initialize_manager),
+        patch.object(dense_lora, "_install_shrink_padding"),
+    ):
+        dense_lora._manager_init(manager, "model", 8, 64, 32000, "lora_config", "npu", "config")
+
+    assert qkvz_layer._ascend_qwen3_5_qkvz_lora is True
+    assert not hasattr(other_layer, "_ascend_qwen3_5_qkvz_lora")
 
 
 @pytest.mark.parametrize("rank", [8, 16])
