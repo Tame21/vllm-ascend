@@ -4,7 +4,6 @@
 from functools import wraps
 
 from vllm.config import CUDAGraphMode
-from vllm.lora.layers.column_parallel_linear import MergedColumnParallelLinearWithLoRA
 from vllm.lora.model_manager import LoRAModelManager
 from vllm.lora.worker_manager import WorkerLoRAManager
 
@@ -185,37 +184,6 @@ def _remap_lora_keys(loras, module_names, packed_modules_mapping, language_prefi
 _ORIGINAL_MANAGER_INIT = LoRAModelManager.__init__
 _ORIGINAL_LOAD_ADAPTER = WorkerLoRAManager._load_adapter
 _ORIGINAL_UPDATE_METADATA = PunicaWrapperNPU.update_metadata
-_ORIGINAL_EXPAND_PACKED_LORA = MergedColumnParallelLinearWithLoRA.expand_packed_lora
-
-
-@wraps(_ORIGINAL_EXPAND_PACKED_LORA)
-def _expand_packed_lora(self, lora_a, lora_b):
-    if not getattr(self, "_ascend_qwen3_5_qkvz_lora", False) or all(b is not None for b in lora_b):
-        return _ORIGINAL_EXPAND_PACKED_LORA(self, lora_a, lora_b)
-
-    # Qwen3.5 in_proj_qkvz has four slices, but the checkpoint groups them
-    # as [qkv, z]. A partial adapter leaves either group as None. The upstream
-    # expansion reads b_i.shape without checking for None, so preserve the
-    # absent group as empty per-slice entries instead of materializing zeros.
-    if len(lora_a) != 2 or len(lora_b) != 2 or self.n_slices != 4 or len(self.output_sizes) != 4:
-        raise ValueError("Incompatible Qwen3.5 in_proj_qkvz LoRA groups")
-    expanded_a = []
-    expanded_b = []
-    start = 0
-    for a_i, b_i, count in zip(lora_a, lora_b, (3, 1)):
-        sizes = self.output_sizes[start : start + count]
-        if (a_i is None) != (b_i is None):
-            raise ValueError("Qwen3.5 in_proj_qkvz LoRA-A/B groups must both be present or absent")
-        if b_i is None:
-            expanded_a.extend([None] * count)
-            expanded_b.extend([None] * count)
-        else:
-            if b_i.shape[0] != sum(sizes):
-                raise ValueError("Incompatible Qwen3.5 in_proj_qkvz LoRA-B group width")
-            expanded_a.extend([a_i] * count)
-            expanded_b.extend(b_i.split(sizes, dim=0))
-        start += count
-    return expanded_a, expanded_b
 
 
 @wraps(_ORIGINAL_MANAGER_INIT)
@@ -234,9 +202,6 @@ def _manager_init(self, model, max_num_seqs, max_num_batched_tokens, vocab_size,
         wrapper._ascend_qwen3_5_lora = True
         wrapper._ascend_specialize_lora = specialize_lora(vllm_config)
         _install_shrink_padding(wrapper)
-    for name, module in self.modules.items():
-        if name.rpartition(".")[-1] == "in_proj_qkvz" and isinstance(module, MergedColumnParallelLinearWithLoRA):
-            module._ascend_qwen3_5_qkvz_lora = True
 
 
 @wraps(_ORIGINAL_LOAD_ADAPTER)
@@ -282,7 +247,6 @@ def _install():
         setattr(PunicaWrapperNPU, name, _no_lora_guard(getattr(PunicaWrapperNPU, name)))
     LoRAModelManager.__init__ = _manager_init
     WorkerLoRAManager._load_adapter = _load_adapter
-    MergedColumnParallelLinearWithLoRA.expand_packed_lora = _expand_packed_lora
     PunicaWrapperNPU._ascend_qwen3_5_patch_installed = True
 
 
