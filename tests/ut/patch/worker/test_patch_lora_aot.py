@@ -289,3 +289,27 @@ def test_install_is_idempotent_and_does_not_replace_ordinary_call():
     assert lora_aot.decorators._try_load_aot_compiled_fn is original_load
     assert wrapper.__call__ is original_call
     assert original_call is lora_graph._wrapper_call
+
+
+def test_disabled_extension_does_not_install_aot_hooks(monkeypatch):
+    native_init = MagicMock()
+    native_aot_compile = MagicMock()
+    native_aot_loader = MagicMock()
+    graph_compile_base = MagicMock()
+    wrapper = SimpleNamespace(
+        __init__=native_init,
+        aot_compile=native_aot_compile,
+        _ascend_lora_graph_patch_installed=True,
+    )
+    monkeypatch.setattr(lora_aot.ascend_envs, "VLLM_ASCEND_ENABLE_LORA_AOT", False)
+    monkeypatch.setattr(lora_aot, "TorchCompileWithNoGuardsWrapper", wrapper)
+    monkeypatch.setattr(lora_aot.decorators, "_try_load_aot_compiled_fn", native_aot_loader)
+    monkeypatch.setattr(lora_graph, "_compile_base_variant", graph_compile_base)
+
+    lora_aot._install()
+
+    assert wrapper.__init__ is native_init
+    assert wrapper.aot_compile is native_aot_compile
+    assert lora_aot.decorators._try_load_aot_compiled_fn is native_aot_loader
+    assert lora_graph._compile_base_variant is graph_compile_base
+    assert not getattr(wrapper, "_ascend_lora_aot_patch_installed", False)

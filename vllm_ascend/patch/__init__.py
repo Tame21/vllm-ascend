@@ -36,7 +36,8 @@
 #   metadata, separate base/LoRA compilation and ACL graph params. The optional
 #   patch_lora_aot extension owns three-variant AOT compilation/cache routing;
 #   load it after patch_lora_acl_graph. See worker/README_lora_aot.md for how to
-#   omit the extension without dropping the non-AOT fixes.
+#   skip it with VLLM_ASCEND_ENABLE_LORA_AOT=0 (default: 1) without dropping the
+#   non-AOT fixes; native AOT then retains its known base/LoRA routing risk.
 #   No feature flag or additional config is required. See worker/README_qwen3_5_lora.md
 #   for supported settings and validation limits.
 #   These replace the external v0.23 patches; do not install both versions.

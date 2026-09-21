@@ -17,6 +17,7 @@
 
 from vllm.triton_utils import HAS_TRITON
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.utils import is_310p, vllm_version_is
 
 if HAS_TRITON:
@@ -57,7 +58,8 @@ if vllm_version_is("0.25.1") and not is_310p():
     import vllm_ascend.patch.worker.patch_lora_acl_graph  # noqa
 
     # Optional AOT extension; keep after the ordinary compilation/ACL graph patch.
-    import vllm_ascend.patch.worker.patch_lora_aot  # noqa
+    if ascend_envs.VLLM_ASCEND_ENABLE_LORA_AOT:
+        import vllm_ascend.patch.worker.patch_lora_aot  # noqa
 
 import vllm_ascend.patch.worker.patch_deepseek_mtp  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_v2  # noqa

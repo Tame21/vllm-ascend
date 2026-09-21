@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
+import ast
 from contextlib import nullcontext
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -200,17 +202,19 @@ def test_no_lora_graph_guard_skips_lora_operator():
 
 
 @pytest.mark.parametrize(
-    ("aot_enabled", "extension_installed", "specialize", "is_encoder", "reject"),
+    ("aot_enabled", "extension_enabled", "extension_installed", "specialize", "is_encoder", "reject"),
     [
-        (True, False, True, False, True),
-        (True, True, True, False, False),
-        (False, False, True, False, False),
-        (True, False, False, False, False),
-        (True, False, True, True, False),
+        (True, True, False, True, False, True),
+        (True, True, True, True, False, False),
+        (True, False, False, True, False, False),
+        (False, True, False, True, False, False),
+        (False, False, False, True, False, False),
+        (True, True, False, False, False, False),
+        (True, True, False, True, True, False),
     ],
 )
 def test_wrapper_init_requires_aot_extension_only_for_specialized_aot(
-    monkeypatch, aot_enabled, extension_installed, specialize, is_encoder, reject
+    monkeypatch, aot_enabled, extension_enabled, extension_installed, specialize, is_encoder, reject
 ):
     config = SimpleNamespace(
         compilation_config=SimpleNamespace(
@@ -218,8 +222,11 @@ def test_wrapper_init_requires_aot_extension_only_for_specialized_aot(
             dynamic_shapes_config=SimpleNamespace(evaluate_guards=False),
         )
     )
-    model = SimpleNamespace()
+    native_aot_compile = MagicMock()
+    native_aot_saver = MagicMock()
+    model = SimpleNamespace(aot_compile=native_aot_compile, save_aot_compiled_function=native_aot_saver)
     monkeypatch.setattr(lora_graph.vllm_envs, "VLLM_USE_AOT_COMPILE", aot_enabled)
+    monkeypatch.setattr(lora_graph.ascend_envs, "VLLM_ASCEND_ENABLE_LORA_AOT", extension_enabled)
     monkeypatch.setattr(lora_graph.vllm_envs, "VLLM_USE_BYTECODE_HOOK", True)
     monkeypatch.setattr(lora_graph.backends, "model_tag", "backbone")
     monkeypatch.setattr(
@@ -234,6 +241,7 @@ def test_wrapper_init_requires_aot_extension_only_for_specialized_aot(
         patch.object(lora_graph, "validate_config"),
         patch.object(lora_graph, "_ORIGINAL_WRAPPER_INIT") as original,
         patch.object(lora_graph, "_compile_base_variant") as compile_base,
+        patch.object(lora_graph.logger, "warning_once") as warning,
     ):
         if reject:
             with pytest.raises(ValueError, match="requires patch_lora_aot"):
@@ -246,6 +254,84 @@ def test_wrapper_init_requires_aot_extension_only_for_specialized_aot(
             assert model._ascend_specialize_lora is (specialize and not is_encoder)
             assert compile_base.call_count == (2 if model._ascend_specialize_lora else 0)
         assert lora_graph.vllm_envs.VLLM_USE_BYTECODE_HOOK is True
+        assert model.aot_compile is native_aot_compile
+        assert model.save_aot_compiled_function is native_aot_saver
+        assert warning.call_count == int(aot_enabled and not extension_enabled and specialize and not is_encoder)
+
+
+@pytest.mark.parametrize(("value", "expected"), [(None, True), ("1", True), ("0", False)])
+def test_lora_aot_switch_defaults_to_enabled(monkeypatch, value, expected):
+    name = "VLLM_ASCEND_ENABLE_LORA_AOT"
+    if value is None:
+        monkeypatch.delenv(name, raising=False)
+    else:
+        monkeypatch.setenv(name, value)
+    assert lora_graph.ascend_envs.env_variables[name]() is expected
+
+
+@pytest.mark.parametrize("extension_enabled", [False, True])
+def test_lora_aot_switch_does_not_disable_acl_graph_parameter_isolation(monkeypatch, extension_enabled):
+    config = _model_config(text_model_type="qwen3_5_text", hf_model_type="qwen3_5_text")
+    config.model_config.enforce_eager = False
+    config.compilation_config = SimpleNamespace(
+        cudagraph_mode=lora_graph.CUDAGraphMode.FULL,
+        cudagraph_specialize_lora=True,
+    )
+    monkeypatch.setattr(lora_graph.ascend_envs, "VLLM_ASCEND_ENABLE_LORA_AOT", extension_enabled)
+    monkeypatch.setattr(lora_graph.vllm_envs, "VLLM_USE_AOT_COMPILE", True)
+    monkeypatch.setattr(lora_graph, "get_current_vllm_config", lambda: config)
+
+    def initialize(params):
+        params.events = {}
+        params.workspaces = {}
+        params.handles = {}
+        params.attn_params = {}
+
+    monkeypatch.setattr(lora_graph._ORIGINAL_GRAPH_PARAMS, "__init__", initialize)
+    params = lora_graph._LoRAGraphParams()
+    for name in ("events", "workspaces", "handles", "attn_params"):
+        assert isinstance(getattr(params, name), lora_graph._GraphParamStore)
+
+
+@pytest.mark.parametrize("extension_enabled", [False, True])
+@pytest.mark.parametrize("release_matches", [False, True])
+@pytest.mark.parametrize("is_310p", [False, True])
+def test_worker_loader_preserves_graph_patch_when_aot_extension_is_disabled(
+    extension_enabled, release_matches, is_310p
+):
+    # Execute the real release-lane import block without importing unrelated
+    # worker patches. This checks both the switch and graph-before-AOT order.
+    loader = Path(lora_graph.__file__).with_name("__init__.py")
+    tree = ast.parse(loader.read_text(encoding="utf-8"))
+    graph_module = "vllm_ascend.patch.worker.patch_lora_acl_graph"
+    block = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.If)
+        and any(
+            isinstance(child, ast.Import) and any(alias.name == graph_module for alias in child.names)
+            for child in ast.walk(node)
+        )
+    )
+    imported = []
+
+    def record_import(name, *args, **kwargs):
+        imported.append(name)
+        return SimpleNamespace()
+
+    namespace = {
+        "__builtins__": {"__import__": record_import},
+        "ascend_envs": SimpleNamespace(VLLM_ASCEND_ENABLE_LORA_AOT=extension_enabled),
+        "vllm_version_is": lambda version: release_matches,
+        "is_310p": lambda: is_310p,
+    }
+    exec(compile(ast.Module(body=[block], type_ignores=[]), str(loader), "exec"), namespace)
+    expected = []
+    if release_matches and not is_310p:
+        expected = ["vllm_ascend.patch.worker.patch_qwen3_5_dense_lora", graph_module]
+        if extension_enabled:
+            expected.append("vllm_ascend.patch.worker.patch_lora_aot")
+    assert imported == expected
 
 
 @pytest.mark.parametrize(

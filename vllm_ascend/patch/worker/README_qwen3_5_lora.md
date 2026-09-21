@@ -50,6 +50,10 @@ call is needed.
   With `VLLM_USE_AOT_COMPILE=1`, the LoRA, dynamic base, and single-token base
   callables are compiled and cached as independent AOT artifacts. A runtime
   dispatcher selects the matching artifact before ACL graph capture or replay.
+  Set `VLLM_ASCEND_ENABLE_LORA_AOT=0` before startup to skip this extension and
+  allow original single-artifact AOT for performance comparisons while keeping
+  `cudagraph_specialize_lora=true`. This intentionally leaves the known AOT
+  routing issue unfixed and may produce incorrect outputs. The default is `1`.
 
 The callable/graph specialization is inactive with `--enforce-eager`, no CUDA
 graph mode, or `cudagraph_specialize_lora=false`. The AOT extension then delegates

@@ -17,6 +17,7 @@ from vllm.compilation.counter import compilation_counter
 from vllm.compilation.wrapper import TorchCompileWithNoGuardsWrapper
 from vllm.logger import logger
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.patch.worker import patch_lora_acl_graph as lora_graph
 
 _ORIGINAL_WRAPPER_INIT = TorchCompileWithNoGuardsWrapper.__init__
@@ -143,6 +144,9 @@ def _try_load_aot_compiled_fn(model, aot_compilation_path):
 
 
 def _install():
+    # Also honor the startup switch when the module is imported directly.
+    if not ascend_envs.VLLM_ASCEND_ENABLE_LORA_AOT:
+        return
     if getattr(TorchCompileWithNoGuardsWrapper, "_ascend_lora_aot_patch_installed", False):
         return
     if not getattr(TorchCompileWithNoGuardsWrapper, "_ascend_lora_graph_patch_installed", False):

@@ -18,6 +18,7 @@ from vllm.logger import logger
 from vllm.lora.model_manager import LoRAModelManager
 from vllm.v1.worker.gpu_model_runner import GPUModelRunner
 
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackendImpl
 from vllm_ascend.attention.utils import using_paged_attention
@@ -302,9 +303,16 @@ def _wrapper_init(self, compile_prefix="", is_encoder=False):
         if vllm_envs.VLLM_USE_AOT_COMPILE and not getattr(
             TorchCompileWithNoGuardsWrapper, "_ascend_lora_aot_patch_installed", False
         ):
-            raise ValueError(
-                "LoRA graph specialization with AOT requires patch_lora_aot; "
-                "load that patch, set cudagraph_specialize_lora=false, or set VLLM_USE_AOT_COMPILE=0"
+            if ascend_envs.VLLM_ASCEND_ENABLE_LORA_AOT:
+                raise ValueError(
+                    "LoRA graph specialization with AOT requires patch_lora_aot; "
+                    "load that patch or explicitly set VLLM_ASCEND_ENABLE_LORA_AOT=0 "
+                    "for an uncorrected native-AOT performance comparison"
+                )
+            logger.warning_once(
+                "VLLM_ASCEND_ENABLE_LORA_AOT=0: retaining ACL graph isolation with upstream single-artifact AOT. "
+                "Base/LoRA AOT routing is not corrected; this mode is for performance comparisons and may "
+                "produce incorrect outputs."
             )
         if config.compilation_config.mode != CompilationMode.VLLM_COMPILE:
             raise ValueError("LoRA graph isolation requires CompilationMode.VLLM_COMPILE")
