@@ -1,9 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 from contextlib import nullcontext
-from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -127,9 +126,9 @@ def test_lora_manager_marks_each_punica_wrapper_for_graph_routing():
 @pytest.mark.parametrize(
     ("has_lora", "num_tokens", "expected"),
     [
-        (True, 1, lora_graph._AOT_LORA),
-        (False, 1, lora_graph._AOT_BASE_ONE),
-        (False, 2, lora_graph._AOT_BASE),
+        (True, 1, lora_graph._VARIANT_LORA),
+        (False, 1, lora_graph._VARIANT_BASE_ONE),
+        (False, 2, lora_graph._VARIANT_BASE),
     ],
 )
 def test_select_variant(has_lora, num_tokens, expected):
@@ -200,129 +199,79 @@ def test_no_lora_graph_guard_skips_lora_operator():
     original.assert_not_called()
 
 
-def test_aot_dispatcher_routes_loaded_variants():
-    model = object()
-    dispatcher = lora_graph._AOTVariantDispatcher()
-    artifacts = {variant: MagicMock(return_value=variant) for variant in lora_graph._AOT_VARIANTS}
-    for variant, artifact in artifacts.items():
-        dispatcher.add_loaded(variant, artifact)
-
-    for variant in lora_graph._AOT_VARIANTS:
-        with patch.object(lora_graph, "_select_variant", return_value=variant):
-            assert dispatcher(model, "input") == variant
-        artifacts[variant].assert_called_once_with(model, "input")
-
-
-def test_aot_dispatcher_lazily_compiles_missing_variant(monkeypatch):
-    artifact = MagicMock(return_value="output")
-    base_callable = MagicMock()
-    base_callable.aot_compile.return_value = artifact
-    model = SimpleNamespace(
-        _compiled_callable=MagicMock(),
-        _ascend_base_callable=base_callable,
-        _ascend_base_one_callable=MagicMock(),
-        _ascend_mark_variant_dynamic_inputs=MagicMock(),
-        vllm_config=MagicMock(),
-        _is_encoder=False,
+@pytest.mark.parametrize(
+    ("aot_enabled", "extension_installed", "specialize", "is_encoder", "reject"),
+    [
+        (True, False, True, False, True),
+        (True, True, True, False, False),
+        (False, False, True, False, False),
+        (True, False, False, False, False),
+        (True, False, True, True, False),
+    ],
+)
+def test_wrapper_init_requires_aot_extension_only_for_specialized_aot(
+    monkeypatch, aot_enabled, extension_installed, specialize, is_encoder, reject
+):
+    config = SimpleNamespace(
+        compilation_config=SimpleNamespace(
+            mode=lora_graph.CompilationMode.VLLM_COMPILE,
+            dynamic_shapes_config=SimpleNamespace(evaluate_guards=False),
+        )
     )
-    dispatcher = lora_graph._AOTVariantDispatcher()
-    monkeypatch.setattr(lora_graph.vllm_envs, "VLLM_DISABLE_COMPILE_CACHE", True)
-    monkeypatch.setattr(lora_graph.compilation_counter, "num_aot_compiles", 0)
-
+    model = SimpleNamespace()
+    monkeypatch.setattr(lora_graph.vllm_envs, "VLLM_USE_AOT_COMPILE", aot_enabled)
+    monkeypatch.setattr(lora_graph.vllm_envs, "VLLM_USE_BYTECODE_HOOK", True)
+    monkeypatch.setattr(lora_graph.backends, "model_tag", "backbone")
+    monkeypatch.setattr(
+        lora_graph.TorchCompileWithNoGuardsWrapper,
+        "_ascend_lora_aot_patch_installed",
+        extension_installed,
+        raising=False,
+    )
     with (
-        patch.object(lora_graph, "_select_variant", return_value=lora_graph._AOT_BASE),
-        patch.object(
-            lora_graph.monitor,
-            "monitor_torch_compile",
-            return_value=nullcontext(),
-        ),
+        patch.object(lora_graph, "get_current_vllm_config", return_value=config),
+        patch.object(lora_graph, "specialize_lora", return_value=specialize),
+        patch.object(lora_graph, "validate_config"),
+        patch.object(lora_graph, "_ORIGINAL_WRAPPER_INIT") as original,
+        patch.object(lora_graph, "_compile_base_variant") as compile_base,
     ):
-        assert dispatcher(model, "input") == "output"
-
-    model._ascend_mark_variant_dynamic_inputs.assert_called_once_with(lora_graph._AOT_BASE, "input")
-    base_callable.aot_compile.assert_called_once_with((("input",), {}))
-    artifact.assert_called_once_with(model, "input")
-
-
-def test_try_loads_each_aot_variant(tmp_path):
-    model = SimpleNamespace(_ascend_specialize_lora=True)
-    artifacts = {variant: MagicMock(name=variant) for variant in lora_graph._AOT_VARIANTS}
-    aot_path = str(tmp_path / "model")
-
-    def load_artifact(_model, path):
-        return artifacts[path.rsplit(".", 1)[-1]]
-
-    with (
-        patch.object(
-            lora_graph,
-            "_ORIGINAL_TRY_LOAD_AOT_COMPILED_FN",
-            side_effect=load_artifact,
-        ) as load,
-        patch.object(lora_graph, "_select_variant", return_value=lora_graph._AOT_LORA),
-    ):
-        dispatcher = lora_graph._try_load_aot_compiled_fn(model, aot_path)
-
-    assert isinstance(dispatcher, lora_graph._AOTVariantDispatcher)
-    assert dispatcher.artifacts == artifacts
-    assert load.call_args_list == [call(model, f"{aot_path}.{variant}") for variant in lora_graph._AOT_VARIANTS]
+        if reject:
+            with pytest.raises(ValueError, match="requires patch_lora_aot"):
+                lora_graph._wrapper_init(model, "model", is_encoder=is_encoder)
+            original.assert_not_called()
+            compile_base.assert_not_called()
+        else:
+            lora_graph._wrapper_init(model, "model", is_encoder=is_encoder)
+            original.assert_called_once_with(model, compile_prefix="model", is_encoder=is_encoder)
+            assert model._ascend_specialize_lora is (specialize and not is_encoder)
+            assert compile_base.call_count == (2 if model._ascend_specialize_lora else 0)
+        assert lora_graph.vllm_envs.VLLM_USE_BYTECODE_HOOK is True
 
 
-def test_partial_aot_cache_is_reused_when_selected_variant_is_missing(tmp_path):
-    base_artifact = MagicMock(name="base")
-    lora_artifact = MagicMock(name="lora")
-    lora_callable = MagicMock()
-    lora_callable.aot_compile.return_value = lora_artifact
+@pytest.mark.parametrize(
+    ("has_lora", "num_tokens", "expected"),
+    [(True, 2, "lora"), (False, 2, "base"), (False, 1, "base_one")],
+)
+def test_ordinary_compile_routes_variants_without_aot_dispatcher(has_lora, num_tokens, expected):
     model = SimpleNamespace(
         _ascend_specialize_lora=True,
-        _compiled_callable=lora_callable,
-        _ascend_base_callable=MagicMock(),
-        _ascend_base_one_callable=MagicMock(),
+        _ascend_has_lora=lambda: has_lora,
+        _compiled_callable=MagicMock(return_value="lora"),
+        _ascend_base_callable=MagicMock(return_value="base"),
+        _ascend_base_one_callable=MagicMock(return_value="base_one"),
+        _ascend_base_dynamic_inputs_marked=False,
         _ascend_mark_variant_dynamic_inputs=MagicMock(),
+        first_compile=True,
+        evaluate_guards=False,
+        _call_with_optional_nvtx_range=lambda fn, *args, **kwargs: fn(*args, **kwargs),
     )
-    aot_path = str(tmp_path / "model")
-
-    def load_artifact(_model, path):
-        return base_artifact if path.endswith(f".{lora_graph._AOT_BASE}") else None
-
+    context = SimpleNamespace(batch_descriptor=SimpleNamespace(num_tokens=num_tokens))
     with (
-        patch.object(
-            lora_graph,
-            "_ORIGINAL_TRY_LOAD_AOT_COMPILED_FN",
-            side_effect=load_artifact,
-        ),
-        patch.object(lora_graph, "_select_variant", return_value=lora_graph._AOT_LORA),
+        patch.object(lora_graph, "is_forward_context_available", return_value=True),
+        patch.object(lora_graph, "get_forward_context", return_value=context),
+        patch.object(lora_graph.wrapper_module, "_compilation_context", side_effect=nullcontext),
     ):
-        assert lora_graph._try_load_aot_compiled_fn(model, aot_path) is None
-        dispatcher = lora_graph._aot_compile(model, "input")
-
-    assert dispatcher.artifacts == {
-        lora_graph._AOT_BASE: base_artifact,
-        lora_graph._AOT_LORA: lora_artifact,
-    }
-    assert not hasattr(model, "_ascend_preloaded_aot_dispatcher")
-
-
-def test_saves_each_aot_variant_to_an_independent_path(tmp_path, monkeypatch):
-    class Artifact:
-        def __init__(self, value):
-            self.value = value
-
-        def save_compiled_function(self, path):
-            Path(path).write_text(self.value, encoding="utf-8")
-
-    dispatcher = lora_graph._AOTVariantDispatcher()
-    dispatcher.artifacts = {variant: Artifact(variant) for variant in lora_graph._AOT_VARIANTS}
-    dispatcher.dirty_variants = set(lora_graph._AOT_VARIANTS)
-    model = SimpleNamespace(
-        _aot_cache_dir=str(tmp_path),
-        _aot_compilation_path=str(tmp_path / "model"),
-    )
-    monkeypatch.setattr(lora_graph.vllm_envs, "VLLM_DISABLE_COMPILE_CACHE", False)
-    monkeypatch.setattr(lora_graph.compilation_counter, "num_aot_artifacts_saved", 0)
-
-    dispatcher.save_dirty(model)
-
-    assert not dispatcher.dirty_variants
-    for variant in lora_graph._AOT_VARIANTS:
-        path = tmp_path / f"model.{variant}"
-        assert path.read_text(encoding="utf-8") == variant
+        assert lora_graph._wrapper_call(model, "input") == expected
+        assert lora_graph._wrapper_call(model, "input") == expected
+    assert model.first_compile is False
+    assert model._ascend_mark_variant_dynamic_inputs.call_count == (1 if expected == "base" else 0)

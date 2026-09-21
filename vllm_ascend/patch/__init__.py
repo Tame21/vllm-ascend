@@ -28,12 +28,15 @@
 
 # What's Patched and how it works:
 #
-# worker/patch_qwen3_5_dense_lora.py and worker/patch_lora_acl_graph.py:
+# worker/patch_qwen3_5_dense_lora.py, worker/patch_lora_acl_graph.py and
+# worker/patch_lora_aot.py:
 #   Qwen3.5 dense LoRA fixes plus graph/AOT isolation for Qwen3.5 and the
 #   Mistral3-based Magistral-Small-2509 on vLLM 0.25.1: packed Qwen LoRA-B
 #   expansion, verified language-module prefix mapping, FIA-only replay
-#   metadata, separate base/LoRA compilation and AOT artifacts, and ACL graph
-#   params.
+#   metadata, separate base/LoRA compilation and ACL graph params. The optional
+#   patch_lora_aot extension owns three-variant AOT compilation/cache routing;
+#   load it after patch_lora_acl_graph. See worker/README_lora_aot.md for how to
+#   omit the extension without dropping the non-AOT fixes.
 #   No feature flag or additional config is required. See worker/README_qwen3_5_lora.md
 #   for supported settings and validation limits.
 #   These replace the external v0.23 patches; do not install both versions.

@@ -4,7 +4,7 @@ These worker patches replace `lora_1.patch`, `patch_qwen3_5_dense_lora.py`
 and `patch_lora_acl_graph_v23.py` from the external v0.23 workaround.
 Do not install the external scripts alongside these patches.
 
-The worker loader imports both modules only for vLLM 0.25.1 on non-310P
+The worker loader imports the three LoRA modules only for vLLM 0.25.1 on non-310P
 devices. The dense-kernel patch is enabled only for `qwen3_5_text`; the
 graph/AOT patch supports both Qwen3.5 and the Mistral3-based
 `mistralai/Magistral-Small-2509`. Runs without LoRA and unrelated models retain
@@ -46,12 +46,19 @@ call is needed.
   `BatchDescriptor`, keeps dummy LoRA counts consistent with capture keys,
   tracks base/adapter state for decode, and excludes Qwen GDN metadata from FIA
   replay without mutating the shared context.
+- `patch_lora_aot.py`: the optional AOT extension, loaded after the graph patch.
   With `VLLM_USE_AOT_COMPILE=1`, the LoRA, dynamic base, and single-token base
   callables are compiled and cached as independent AOT artifacts. A runtime
   dispatcher selects the matching artifact before ACL graph capture or replay.
 
-The second module is inactive with `--enforce-eager` or no CUDA graph mode.
-The first module still provides LoRA-B and name/metadata fixes in eager mode.
+The callable/graph specialization is inactive with `--enforce-eager`, no CUDA
+graph mode, or `cudagraph_specialize_lora=false`. The AOT extension then delegates
+to vLLM's original AOT entry points. The dense module still provides LoRA-B and
+name/metadata fixes, and the graph module retains its FIA metadata filtering.
+
+See [LoRA AOT extension](README_lora_aot.md) for the separate module's hooks,
+cache files, and deployment without AOT splitting. Do not remove the whole graph
+patch just to disable AOT splitting.
 
 ## Scope and verification
 
