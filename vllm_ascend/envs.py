@@ -66,6 +66,11 @@ env_variables: dict[str, Callable[[], Any]] = {
     # In this case, developers need to set this value to "0.9.0" to make sure
     # that the correct package is installed.
     "VLLM_VERSION": lambda: os.getenv("VLLM_VERSION", None),
+    # Enable separate LoRA/base/base_one AOT artifacts for the release-lane
+    # LoRA graph patch. Non-sensitive startup switch: 1 (default) enables the
+    # routing fix; 0 keeps native single-artifact AOT even with
+    # VLLM_USE_AOT_COMPILE=1. Ordinary compile and ACL graph fixes stay enabled.
+    "VLLM_ASCEND_ENABLE_LORA_AOT": lambda: bool(int(os.getenv("VLLM_ASCEND_ENABLE_LORA_AOT", "1"))),
     # Whether to enable FlashComm optimization when tensor parallel is enabled.
     # This feature will get better performance when concurrency is large.
     # DEPRECATED: use additional_config.enable_flashcomm1 instead.
