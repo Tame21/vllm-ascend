@@ -20,6 +20,7 @@
 from collections.abc import Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
+from functools import partial
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
@@ -274,6 +275,7 @@ def build_attn_metadata(
     # extra attributes for ascend npus.
     parallel_config: ParallelConfig | None = None,
     seq_lens_np: np.ndarray | None = None,
+    seq_lens_cpu_list: list[int] | None = None,
     seq_lens_cpu_upper_bound: torch.Tensor | None = None,
     num_computed_tokens_cpu: torch.Tensor | None = None,
     positions: torch.Tensor | None = None,
@@ -292,7 +294,9 @@ def build_attn_metadata(
     # seq_lens_np is used for ascend npus, it maybe None in spec_decode case,
     # we fill it with max_seq_len in case `attn_metadata_builder.build` raise
     # an error.
-    if seq_lens_np is None:
+    if seq_lens_cpu_list is not None:
+        seq_lens_np = np.asarray(seq_lens_cpu_list, dtype=np.int32)
+    elif seq_lens_np is None:
         seq_lens_np = np.full(num_reqs, max_seq_len, dtype=np.int32)
     seq_lens_cpu = torch.from_numpy(seq_lens_np)[:num_reqs]
     if seq_lens_cpu_upper_bound is None:
@@ -349,6 +353,7 @@ def build_attn_metadata(
             query_start_loc=query_start_loc_gpu,
             query_start_loc_cpu=query_start_loc_cpu,
             seq_lens_cpu=seq_lens_cpu,
+            seq_lens_cpu_list=seq_lens_cpu_list,
             seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
             seq_lens=seq_lens[:num_reqs],
             num_reqs=num_reqs,
@@ -1285,11 +1290,15 @@ _BUILD_ATTN_METADATA_MODULE = vllm.v1.worker.gpu.spec_decode.speculator
 
 
 @contextmanager
-def build_attn_metadata_wrapper():
+def build_attn_metadata_wrapper(*, seq_lens_cpu_list: list[int] | None = None):
     """Context manager to override attention metadata building for Ascend NPUs."""
     original_func = _BUILD_ATTN_METADATA_MODULE.build_attn_metadata
     try:
-        _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = build_attn_metadata
+        _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = (
+            build_attn_metadata
+            if seq_lens_cpu_list is None
+            else partial(build_attn_metadata, seq_lens_cpu_list=seq_lens_cpu_list)
+        )
         yield
     finally:
         _BUILD_ATTN_METADATA_MODULE.build_attn_metadata = original_func
