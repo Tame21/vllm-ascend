@@ -94,6 +94,12 @@ class AscendModelState(DefaultModelState):
         )
         # attn_metadata is needed when update_full_graph_params, but no way can get it now.
         # Temporarily store it in model_state.
+        # Real target batches have rejection-corrected CPU lengths. Ignore stale
+        # padding slots; dummy profiling can adjust only the device lengths.
+        seq_lens_cpu_list = None
+        if input_batch.seq_lens_np is not None and not getattr(input_batch, "is_dummy", False):
+            seq_lens_cpu_list = input_batch.seq_lens_np[:num_actual_reqs].tolist()
+            seq_lens_cpu_list.extend([0] * (num_reqs - num_actual_reqs))
         self.attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -114,6 +120,7 @@ class AscendModelState(DefaultModelState):
             parallel_config=self.vllm_config.parallel_config,
             # extra attributes for ascend npus.
             seq_lens_np=input_batch.seq_lens_np,
+            seq_lens_cpu_list=seq_lens_cpu_list,
             positions=input_batch.positions,
             attn_state=input_batch.attn_state,
             pcp_context=pcp_context,

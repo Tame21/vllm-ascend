@@ -302,6 +302,12 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
         )
+        # Real target batches have rejection-corrected CPU lengths. Ignore stale
+        # padding slots; dummy profiling can adjust only the device lengths.
+        seq_lens_cpu_list = None
+        if input_batch.seq_lens_np is not None and not getattr(input_batch, "is_dummy", False):
+            seq_lens_cpu_list = input_batch.seq_lens_np[: input_batch.num_reqs].tolist()
+            seq_lens_cpu_list.extend([0] * (num_reqs - input_batch.num_reqs))
         self.attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
@@ -319,6 +325,7 @@ class AscendMambaHybridModelState(MambaHybridModelState, AscendModelState):
             dcp_local_seq_lens=input_batch.dcp_local_seq_lens,
             parallel_config=self.vllm_config.parallel_config,
             seq_lens_np=input_batch.seq_lens_np,
+            seq_lens_cpu_list=seq_lens_cpu_list,
             positions=input_batch.positions,
             attn_state=input_batch.attn_state,
             model_specific_attn_metadata=model_specific_metadata,

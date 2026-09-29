@@ -1,20 +1,28 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Exercise the DSpark/MTP entry points, not just the length helper."""
+"""Exercise draft metadata entry points, not just the length helpers."""
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
 import torch
 from vllm.config import AttentionConfig
+from vllm.config.compilation import CUDAGraphMode
+from vllm.v1.worker.gpu.cudagraph_utils import BatchExecutionDescriptor
 from vllm.v1.worker.gpu.spec_decode import speculator as upstream_speculator
 from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import AutoRegressiveSpeculator
+from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
+from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder
 from vllm_ascend.attention.context_parallel import sfa_cp
 from vllm_ascend.attention.context_parallel.sfa_cp import AscendSFADCPMetadata, AscendSFADCPMetadataBuilder
 from vllm_ascend.worker.dcp_utils import DCPManager
 from vllm_ascend.worker.v2 import attn_utils
+from vllm_ascend.worker.v2.model_states.default import AscendModelState
+from vllm_ascend.worker.v2.model_states.mamba_hybrid import AscendMambaHybridModelState
+from vllm_ascend.worker.v2.spec_decode.dflash.speculator import AscendDFlashSpeculator
 from vllm_ascend.worker.v2.spec_decode.dspark.speculator import AscendDSparkSpeculator
 from vllm_ascend.worker.v2.spec_decode.mtp.speculator import AscendMTPSpeculator
 
@@ -71,8 +79,10 @@ def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=Tr
     manager.dcp_world_size = config.parallel_config.decode_context_parallel_size
     manager.dcp_world_rank = 1 if use_dcp else 0
     manager.vllm_config = config
-    cls = AscendDSparkSpeculator if kind == "dspark" else AscendMTPSpeculator
+    cls = {"dspark": AscendDSparkSpeculator, "mtp": AscendMTPSpeculator, "dflash": AscendDFlashSpeculator}[kind]
     spec = object.__new__(cls)
+    if kind == "dflash":
+        spec._draft_seq_lens_cpu_list = None
     spec.attn_architecture = architecture
     spec.use_dcp = use_dcp
     spec.dcp_manager = manager
@@ -145,6 +155,188 @@ def _speculator(monkeypatch, kind, architecture, width, padded, step, use_dcp=Tr
     monkeypatch.setattr(upstream_speculator, prepare_name, prepare_device)
     monkeypatch.setattr(attn_utils, "get_dcp_group", lambda: SimpleNamespace(rank_in_group=1))
     return spec, target.clone(), device_lengths.clone()
+
+
+@pytest.mark.parametrize("graph_mode,padded", [(CUDAGraphMode.NONE, 2), (CUDAGraphMode.FULL, 4)])
+def test_dflash_reuses_exact_lengths_across_groups_and_replay(monkeypatch, graph_mode, padded):
+    """One device-list conversion per proposal, even with mixed cache groups."""
+    spec, _, _ = _speculator(monkeypatch, "dflash", "GQA", 4, padded, 4, use_dcp=False)
+    builder = object.__new__(AscendAttentionMetadataBuilder)
+    builder.pcp_enabled = False
+    builder.kv_cache_spec = None
+    builder.speculative_config = SimpleNamespace(parallel_drafting=True)
+    builder.device = torch.device("cpu")
+    builder.model_config = SimpleNamespace(runner_type="generate")
+    builder.attn_mask_builder = MagicMock()
+    builder._split_decodes_and_prefills = lambda common: (padded, 0, padded * 4, 0)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+
+    def build(common_prefix_len, common_attn_metadata):
+        metadata = builder.build(common_prefix_len, common_attn_metadata)
+        metadata.common = common_attn_metadata
+        return metadata
+
+    spec.attn_groups[0][0].get_metadata_builder = lambda _: SimpleNamespace(build=build)
+    second_group = SimpleNamespace(
+        get_metadata_builder=spec.attn_groups[0][0].get_metadata_builder, layer_names=["draft.sliding"]
+    )
+    spec.attn_groups.append([second_group])
+    spec.kv_cache_config.kv_cache_groups.append(None)
+    spec.block_tables.input_block_tables *= 2
+    spec.block_tables.slot_mappings = torch.zeros((2, padded * 4), dtype=torch.int64)
+    spec._group_causal = {0: False, 1: True}
+    desc = BatchExecutionDescriptor(cg_mode=graph_mode, num_tokens=padded * 4, num_reqs=padded)
+    device_lengths = spec.input_buffers.seq_lens
+    device_readbacks = []
+    original_tolist = torch.Tensor.tolist
+
+    def track_device_readback(tensor):
+        if tensor.untyped_storage().data_ptr() == device_lengths.untyped_storage().data_ptr():
+            device_readbacks.append(tensor.numel())
+        return original_tolist(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", track_device_readback)
+
+    def propose(self, *args, **kwargs):
+        previous_readbacks = len(device_readbacks)
+        metadata = self._build_uniform_attn_metadata(
+            batch_desc=desc,
+            num_reqs=2,
+            num_query_per_req=4,
+            seq_lens_cpu_upper_bound=self.input_batch.seq_lens_cpu_upper_bound,
+            step=4,
+            causal=self._group_causal,
+        )
+        if graph_mode == CUDAGraphMode.FULL:
+            replay_metadata = self.build_draft_attn_metadatas(padded, self.input_batch.seq_lens_cpu_upper_bound)[0]
+            for name in metadata:
+                assert replay_metadata[name].common.seq_lens_cpu_list == metadata[name].common.seq_lens_cpu_list
+                assert replay_metadata[name].actual_seq_lengths_q == [4, 8, 12, 16]
+        assert len(device_readbacks) - previous_readbacks == 1, device_readbacks[previous_readbacks:]
+        return metadata
+
+    monkeypatch.setattr(DFlashSpeculator, "propose", propose)
+    # The first batch includes rejection and model-length clamping. The second
+    # represents new requests occupying the same slots with shorter sequences.
+    for expected in ([29, 128], [17, 63]):
+        device_lengths[:2] = torch.tensor(expected, dtype=torch.int32)
+        result = spec.propose(spec.input_batch, {}, {}, None, None, None, None, None, None, None, None)
+        for i, name in enumerate(("draft.layer", "draft.sliding")):
+            common = result[name].common
+            assert result[name].seq_lens_list == expected + [0] * (padded - 2)
+            assert common.seq_lens_cpu_list == expected + [0] * (padded - 2)
+            assert common.seq_lens_cpu.tolist() == common.seq_lens_cpu_list
+            assert common.seq_lens.data_ptr() == device_lengths.data_ptr()
+            assert common.causal is bool(i)
+        assert spec._draft_seq_lens_cpu_list is None
+    assert device_readbacks == [2, 2]
+
+
+def test_dflash_discards_length_snapshot_after_failed_proposal(monkeypatch):
+    spec, _, _ = _speculator(monkeypatch, "dflash", "GQA", 4, 2, 4, use_dcp=False)
+
+    def fail(self, *args, **kwargs):
+        self._draft_seq_lens_cpu_list = [100, 200]
+        raise RuntimeError("draft failed")
+
+    monkeypatch.setattr(DFlashSpeculator, "propose", fail)
+    with pytest.raises(RuntimeError, match="draft failed"):
+        spec.propose(spec.input_batch, {}, {}, None, None, None, None, None, None, None, None)
+    assert spec._draft_seq_lens_cpu_list is None
+
+
+@pytest.mark.parametrize("state_cls", [AscendModelState, AscendMambaHybridModelState])
+@pytest.mark.parametrize("graph_mode,padded", [(CUDAGraphMode.NONE, 2), (CUDAGraphMode.FULL, 4)])
+@pytest.mark.parametrize("cpu_capacity", [2, 4])
+@pytest.mark.parametrize("is_dummy", [False, True])
+def test_target_reuses_corrected_cpu_lengths_without_device_readback(
+    monkeypatch, state_cls, graph_mode, padded, cpu_capacity, is_dummy
+):
+    """Target batches reuse exact host lengths; dummy profiling retains its fallback."""
+    spec, _, _ = _speculator(monkeypatch, "dflash", "GQA", 4, padded, 4, use_dcp=False)
+    spec.vllm_config.parallel_config.prefill_context_parallel_size = 1
+    spec.vllm_config.num_speculative_tokens = 3
+    state = SimpleNamespace(
+        vllm_config=spec.vllm_config,
+        max_model_len=128,
+        pcp_manager=None,
+        kvpp_runtime=None,
+        num_accepted_tokens_gpu=torch.tensor([2, 1]),
+    )
+    device_lengths = spec.input_buffers.seq_lens
+    batch = SimpleNamespace(
+        num_reqs=2,
+        num_reqs_after_padding=padded,
+        num_tokens=8,
+        num_tokens_after_padding=padded * 4,
+        is_prefilling_np=np.array([False, False]),
+        idx_mapping=torch.tensor([0, 1]),
+        num_draft_tokens_per_req=np.array([3, 3]),
+        num_scheduled_tokens=np.array([4, 4]),
+        query_start_loc=torch.arange(padded + 1, dtype=torch.int32) * 4,
+        query_start_loc_np=np.arange(padded + 1, dtype=np.int32) * 4,
+        seq_lens=device_lengths[:padded],
+        seq_lens_np=np.full(cpu_capacity, 99, dtype=np.int32),
+        seq_lens_cpu_upper_bound=torch.tensor([33, 128]),
+        dcp_local_seq_lens=None,
+        positions=torch.arange(padded * 4),
+        attn_state=None,
+        is_dummy=is_dummy,
+    )
+    builder = object.__new__(AscendAttentionMetadataBuilder)
+    builder.pcp_enabled = False
+    builder.kv_cache_spec = None
+    builder.speculative_config = SimpleNamespace(parallel_drafting=True)
+    builder.device = torch.device("cpu")
+    builder.model_config = SimpleNamespace(runner_type="generate")
+    builder.attn_mask_builder = MagicMock()
+    builder._split_decodes_and_prefills = lambda common: (padded, 0, padded * 4, 0)
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+
+    def build(common_prefix_len, common_attn_metadata):
+        metadata = builder.build(common_prefix_len, common_attn_metadata)
+        metadata.common = common_attn_metadata
+        return metadata
+
+    group = SimpleNamespace(
+        get_metadata_builder=lambda _: SimpleNamespace(
+            build=build, build_for_cudagraph_capture=lambda common: build(0, common)
+        ),
+        layer_names=["target.layer"],
+    )
+    groups = [[group], [SimpleNamespace(get_metadata_builder=group.get_metadata_builder, layer_names=["target.other"])]]
+    original_tolist = torch.Tensor.tolist
+    readbacks = []
+
+    def count_device_readback(tensor):
+        if tensor.untyped_storage().data_ptr() == device_lengths.untyped_storage().data_ptr():
+            readbacks.append(tensor.numel())
+        return original_tolist(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "tolist", count_device_readback)
+    # The second batch reuses request slots; padded CPU slots deliberately stay stale.
+    for expected in ([29, 128], [17, 63]):
+        device_lengths[:2] = torch.tensor(expected)
+        batch.seq_lens_np[:2] = [3, 4] if is_dummy else expected
+        previous_readbacks = len(readbacks)
+        metadata = state_cls.prepare_attn(
+            state,
+            batch,
+            graph_mode,
+            tuple(spec.block_tables.input_block_tables * 2),
+            torch.zeros((2, padded * 4), dtype=torch.int64),
+            groups,
+            SimpleNamespace(kv_cache_groups=[None, None]),
+            for_capture=is_dummy and graph_mode == CUDAGraphMode.FULL,
+        )
+        assert len(readbacks) - previous_readbacks == (2 if is_dummy else 0)
+        for layer_metadata in metadata.values():
+            assert layer_metadata.seq_lens_list == expected + [0] * (padded - 2)
+            assert layer_metadata.seq_lens.data_ptr() == device_lengths.data_ptr()
+        if not is_dummy:
+            first, second = metadata.values()
+            assert first.common.seq_lens_cpu_list is second.common.seq_lens_cpu_list
+            assert first.common.seq_lens_cpu.tolist() == expected + [0] * (padded - 2)
 
 
 @pytest.mark.parametrize(

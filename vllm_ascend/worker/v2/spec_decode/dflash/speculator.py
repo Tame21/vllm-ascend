@@ -3,6 +3,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import logging
+from collections.abc import Mapping
 from typing import Any, cast
 
 import torch
@@ -24,6 +25,33 @@ logger = logging.getLogger(__name__)
 
 
 class AscendDFlashSpeculator(DFlashSpeculator):
+    def _build_uniform_attn_metadata(
+        self,
+        batch_desc: BatchExecutionDescriptor,
+        num_reqs: int,
+        num_query_per_req: int,
+        seq_lens_cpu_upper_bound: torch.Tensor,
+        step: int,
+        causal: bool | Mapping[int, bool] = True,
+        dcp_local_seq_lens: torch.Tensor | None = None,
+    ) -> dict[str, Any] | None:
+        # The input kernel has applied rejection and model-length clamping.
+        # Share this exact snapshot across KV groups and the graph replay rebuild.
+        if self._draft_seq_lens_cpu_list is None:
+            self._draft_seq_lens_cpu_list = self.input_buffers.seq_lens[:num_reqs].tolist()
+        num_reqs_padded = batch_desc.num_reqs or num_reqs
+        seq_lens_cpu_list = self._draft_seq_lens_cpu_list + [0] * (num_reqs_padded - num_reqs)
+        with build_attn_metadata_wrapper(seq_lens_cpu_list=seq_lens_cpu_list):
+            return super()._build_uniform_attn_metadata(
+                batch_desc=batch_desc,
+                num_reqs=num_reqs,
+                num_query_per_req=num_query_per_req,
+                seq_lens_cpu_upper_bound=seq_lens_cpu_upper_bound,
+                step=step,
+                causal=causal,
+                dcp_local_seq_lens=dcp_local_seq_lens,
+            )
+
     def build_draft_attn_metadatas(self, num_reqs_padded, seq_lens_cpu_upper_bound):
         num_tokens_padded = num_reqs_padded * self.num_query_per_req
         with build_attn_metadata_wrapper():
@@ -65,6 +93,7 @@ class AscendDFlashSpeculator(DFlashSpeculator):
 
     def __init__(self, vllm_config: VllmConfig, device: torch.device):
         super().__init__(vllm_config, device)
+        self._draft_seq_lens_cpu_list: list[int] | None = None
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         if self.speculative_config.enforce_eager:
@@ -133,6 +162,7 @@ class AscendDFlashSpeculator(DFlashSpeculator):
         is_profile: bool = False,
     ) -> torch.Tensor:
         self.input_batch = input_batch
+        self._draft_seq_lens_cpu_list = None
         sync_state = dp_sync
         if dummy_run and skip_attn_for_dummy_run:
             # Profiling runs the draft with its own query token count, which
@@ -141,25 +171,28 @@ class AscendDFlashSpeculator(DFlashSpeculator):
             # TODO: Remove this guard once main2main includes upstream vLLM
             # #54856 (facd9a74a1), which resets the profiling DP counts.
             sync_state = None
-        with build_attn_metadata_wrapper():
-            return super().propose(
-                input_batch,
-                attn_metadata,
-                slot_mappings,
-                last_hidden_states,
-                aux_hidden_states,
-                num_sampled,
-                num_rejected,
-                last_sampled,
-                next_prefill_tokens,
-                temperature,
-                seeds,
-                sync_state,
-                dummy_run,
-                skip_attn_for_dummy_run,
-                mm_inputs,
-                is_profile=is_profile,
-            )
+        try:
+            with build_attn_metadata_wrapper():
+                return super().propose(
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings,
+                    last_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    sync_state,
+                    dummy_run,
+                    skip_attn_for_dummy_run,
+                    mm_inputs,
+                    is_profile=is_profile,
+                )
+        finally:
+            self._draft_seq_lens_cpu_list = None
 
 
 # Keep the Ascend scalar-loop implementation while sharing upstream's CP

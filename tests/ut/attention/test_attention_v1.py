@@ -165,6 +165,7 @@ class TestAscendAttentionMetadataBuilder(TestBase):
             seq_lens=torch.tensor([4, 5, 6], dtype=torch.int32),
             _seq_lens_cpu=internal_seq_lens_cpu,
             seq_lens_cpu=None,
+            seq_lens_cpu_list=[4, 5, 6],
             num_computed_tokens_cpu=None,
             num_reqs=3,
             num_actual_tokens=9,
@@ -182,6 +183,7 @@ class TestAscendAttentionMetadataBuilder(TestBase):
 
         self.assertTrue(torch.equal(unpadded_metadata._seq_lens_cpu, internal_seq_lens_cpu[:2]))
         self.assertIsNone(unpadded_metadata.seq_lens_cpu)
+        self.assertEqual(unpadded_metadata.seq_lens_cpu_list, [4, 5])
 
     @patch.object(AscendAttentionMetadataBuilder, "metadata_cls")
     def test_build(self, mock_ascend_metadata):
@@ -205,6 +207,47 @@ class TestAscendAttentionMetadataBuilder(TestBase):
         mock_model = MagicMock()
 
         self.builder.build(1, common_attn_metadata, mock_model)
+
+    def test_parallel_draft_uses_exact_host_list_without_reading_device(self):
+        self.builder.speculative_config = SimpleNamespace(parallel_drafting=True)
+        device_lengths = torch.tensor([29, 128], dtype=torch.int32)
+        common = AscendCommonAttentionMetadata(
+            query_start_loc=torch.tensor([0, 4, 8]),
+            query_start_loc_cpu=torch.tensor([0, 4, 8]),
+            seq_lens=device_lengths,
+            seq_lens_cpu=torch.tensor([128, 128]),
+            seq_lens_cpu_list=[29, 128],
+            seq_lens_cpu_upper_bound=torch.tensor([33, 128]),
+            num_reqs=2,
+            num_actual_tokens=8,
+            max_query_len=4,
+            max_seq_len=128,
+            block_table_tensor=torch.zeros((2, 8), dtype=torch.int32),
+            slot_mapping=torch.arange(8),
+            causal=False,
+        )
+        original_tolist = torch.Tensor.tolist
+
+        def reject_device_readback(tensor):
+            if tensor.untyped_storage().data_ptr() == device_lengths.untyped_storage().data_ptr():
+                raise AssertionError("parallel draft lengths must use the shared host snapshot")
+            return original_tolist(tensor)
+
+        with patch.object(torch.Tensor, "tolist", reject_device_readback):
+            metadata = self.builder.build(0, common)
+        self.assertEqual(metadata.seq_lens_list, [29, 128])
+        self.assertEqual(metadata.seq_lens.data_ptr(), device_lengths.data_ptr())
+
+        # Capture and callers without a snapshot must still read exact device
+        # lengths, never the placeholder CPU lengths or the scheduler upper bound.
+        common.seq_lens_cpu_list = None
+        metadata = self.builder.build(0, common)
+        self.assertEqual(metadata.seq_lens_list, [29, 128])
+
+        self.builder.speculative_config.parallel_drafting = False
+        with patch.object(torch.Tensor, "tolist", reject_device_readback):
+            metadata = self.builder.build(0, common)
+        self.assertEqual(metadata.seq_lens_list, [128, 128])
 
 
 def test_pcp_metadata_keeps_expanded_slot_mapping() -> None:
