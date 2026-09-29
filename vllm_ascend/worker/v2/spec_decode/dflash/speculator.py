@@ -195,8 +195,7 @@ class AscendDFlashSpeculator(DFlashSpeculator):
             self._draft_seq_lens_cpu_list = None
 
 
-# Keep the Ascend scalar-loop implementation while sharing upstream's CP
-# slot ownership and local-offset rules for both DFlash and DSpark.
+# Share upstream's CP slot ownership and local-offset rules.
 @triton.jit
 def _prepare_dflash_inputs_kernel_ascend(
     # Outputs
@@ -240,13 +239,11 @@ def _prepare_dflash_inputs_kernel_ascend(
     CP_SIZE: tl.constexpr,
     CP_INTERLEAVE: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    PAD_BLOCK_SIZE: tl.constexpr = 256,
 ):
     req_idx = tl.program_id(0)
     block_idx = tl.program_id(1)
     num_reqs = tl.num_programs(0)
-
-    if block_idx > 0:
-        return
 
     req_state_idx = tl.load(idx_mapping_ptr + req_idx)
 
@@ -268,10 +265,18 @@ def _prepare_dflash_inputs_kernel_ascend(
     last_valid_pos = tl.load(target_positions_ptr + valid_ctx_end - 1)
     query_base = req_idx * num_query_per_req
 
-    # --- Context positions / slots ---
-    for j in range(0, num_ctx):
-        ctx_pos_idx = ctx_start + j
+    # Each program handles a tile of the context/query span. Query rows
+    # overlap the rejected context suffix, but write to separate buffers.
+    span = tl.maximum(num_ctx, num_valid_ctx + num_query_per_req)
+    stride = tl.num_programs(1) * BLOCK_SIZE
+    for start in range(block_idx * BLOCK_SIZE, span, stride):
+        j = start + tl.arange(0, BLOCK_SIZE)
+        is_ctx = j < num_ctx
         is_valid_ctx = j < num_valid_ctx
+        query_off = j - num_valid_ctx
+        is_query = (query_off >= 0) & (query_off < num_query_per_req)
+
+        ctx_pos_idx = ctx_start + tl.where(is_ctx, j, 0)
         ctx_pos = tl.load(target_positions_ptr + ctx_pos_idx, mask=is_valid_ctx, other=0)
         ctx_block_num = ctx_pos // (block_size * CP_SIZE)
         ctx_block_num = tl.minimum(ctx_block_num, block_table_stride - 1)
@@ -282,74 +287,62 @@ def _prepare_dflash_inputs_kernel_ascend(
         ).to(tl.int64)
         local_ctx_slot = cp_local_slot(ctx_pos, ctx_block_id, block_size, cp_rank, CP_SIZE, CP_INTERLEAVE, PAD_SLOT_ID)
         ctx_slot = tl.where(is_valid_ctx & (ctx_block_id != 0), local_ctx_slot, PAD_SLOT_ID)
-        tl.store(out_context_positions_ptr + ctx_pos_idx, ctx_pos)
-        tl.store(out_context_slot_mapping_ptr + ctx_pos_idx, ctx_slot)
+        # Rejected rows must be initialized too, so a later replay cannot
+        # read positions or writable slots left by a previous batch.
+        tl.store(out_context_positions_ptr + ctx_start + j, ctx_pos, mask=is_ctx)
+        tl.store(out_context_slot_mapping_ptr + ctx_start + j, ctx_slot, mask=is_ctx)
 
-    # --- Query positions / input_ids / slots ---
-    for q_off in range(0, num_query_per_req):
-        query_pos = last_valid_pos + 1 + q_off
-        query_idx = query_base + q_off
-        if q_off == 0:
-            input_id = bonus_token
-        else:
-            input_id = parallel_drafting_token_id
+        query_pos = last_valid_pos + 1 + query_off
+        query_idx = query_base + query_off
+        input_id = tl.where(query_off == 0, bonus_token, parallel_drafting_token_id)
 
         q_block_num = query_pos // (block_size * CP_SIZE)
         q_block_num = tl.minimum(q_block_num, block_table_stride - 1)
-        q_block_id = tl.load(block_table_ptr + req_idx * block_table_stride + q_block_num).to(tl.int64)
+        q_block_id = tl.load(block_table_ptr + req_idx * block_table_stride + q_block_num, mask=is_query, other=0).to(
+            tl.int64
+        )
         local_q_slot = cp_local_slot(query_pos, q_block_id, block_size, cp_rank, CP_SIZE, CP_INTERLEAVE, PAD_SLOT_ID)
         q_slot = tl.where(q_block_id != 0, local_q_slot, PAD_SLOT_ID)
 
-        tl.store(out_input_ids_ptr + query_idx, input_id)
+        tl.store(out_input_ids_ptr + query_idx, input_id, mask=is_query)
         clamped_query_pos = tl.minimum(query_pos, max_model_len - 1)
-        tl.store(out_query_positions_ptr + query_idx, clamped_query_pos)
-        tl.store(out_query_slot_mapping_ptr + query_idx, q_slot)
+        tl.store(out_query_positions_ptr + query_idx, clamped_query_pos, mask=is_query)
+        tl.store(out_query_slot_mapping_ptr + query_idx, q_slot, mask=is_query)
 
-    sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
-    # --- Sample indices / positions / idx_mapping ---
-    for s_off in range(sample_off, num_query_per_req):
-        sample_idx = req_idx * num_speculative_steps + (s_off - sample_off)
-        query_idx = query_base + s_off
-        query_pos = last_valid_pos + 1 + s_off
+        sample_off = 0 if SAMPLE_FROM_ANCHOR else 1
+        is_sample = is_query & (query_off >= sample_off)
+        sample_idx = req_idx * num_speculative_steps + (query_off - sample_off)
         sample_pos = query_pos + 1 if SAMPLE_FROM_ANCHOR else query_pos
-        tl.store(out_sample_indices_ptr + sample_idx, query_idx)
-        tl.store(out_sample_pos_ptr + sample_idx, sample_pos)
-        tl.store(out_sample_idx_mapping_ptr + sample_idx, req_state_idx)
+        tl.store(out_sample_indices_ptr + sample_idx, query_idx, mask=is_sample)
+        tl.store(out_sample_pos_ptr + sample_idx, sample_pos, mask=is_sample)
+        tl.store(out_sample_idx_mapping_ptr + sample_idx, req_state_idx, mask=is_sample)
 
-    tl.store(out_query_start_loc_ptr + req_idx, query_base)
-    # seq_lens is the absolute sequence length the draft attention
-    # reads up to (context + query), not just the count of accepted
-    # tokens this step.
-    tl.store(out_seq_lens_ptr + req_idx, tl.minimum(last_valid_pos + 1 + num_query_per_req, max_model_len))
-    # Copy sampling state (added upstream in vllm-project/vllm#50000).
-    tl.store(
-        out_temperature_ptr + req_state_idx,
-        tl.load(temperature_ptr + req_state_idx),
-    )
-    tl.store(
-        out_seeds_ptr + req_state_idx,
-        tl.load(seeds_ptr + req_state_idx),
-    )
+    if block_idx == 0:
+        tl.store(out_query_start_loc_ptr + req_idx, query_base)
+        tl.store(out_seq_lens_ptr + req_idx, tl.minimum(last_valid_pos + 1 + num_query_per_req, max_model_len))
+        tl.store(out_temperature_ptr + req_state_idx, tl.load(temperature_ptr + req_state_idx))
+        tl.store(out_seeds_ptr + req_state_idx, tl.load(seeds_ptr + req_state_idx))
 
-    if req_idx == num_reqs - 1:
-        # Pad per-request buffers to max_num_reqs for CUDA graph safety.
-        last_query_end = num_reqs * num_query_per_req
-        for i in range(num_reqs, max_num_reqs + 1):
-            tl.store(out_query_start_loc_ptr + i, last_query_end)
-        for i in range(num_reqs, max_num_reqs):
-            tl.store(out_seq_lens_ptr + i, 0)
-        # Padded sample slots point at query index 0 (a valid row in
-        # last_hidden_states) so CG replay never reads OOB. Padded sample
-        # idx mappings point to -1, which is ignored during sampling.
-        pad_start = num_reqs * num_speculative_steps
-        pad_end = max_num_reqs * num_speculative_steps
-        for i in range(pad_start, pad_end):
-            tl.store(out_sample_indices_ptr + i, 0)
-            tl.store(out_sample_pos_ptr + i, 0)
-            tl.store(out_sample_idx_mapping_ptr + i, -1)
-        # Pad query slot mappings past num_query_tokens with PAD so the
-        # captured CG sees PAD slots (no K/V write) for replay sizes
-        # larger than the current request count.
-        q_pad_start = num_reqs * num_query_per_req
-        for i in range(q_pad_start, max_num_tokens):
-            tl.store(out_query_slot_mapping_ptr + i, PAD_SLOT_ID)
+    # Distribute padding across ALL programs, independently of the request
+    # tile size (which can be tiny during decode). Padding and active writes
+    # are disjoint, so this needs neither a second launch nor a barrier.
+    last_query_end = num_reqs * num_query_per_req
+    sample_start = num_reqs * num_speculative_steps
+    sample_end = max_num_reqs * num_speculative_steps
+    pad_count = tl.maximum(max_num_reqs - num_reqs + 1, sample_end - sample_start)
+    pad_count = tl.maximum(pad_count, max_num_tokens - last_query_end)
+    pad_program = req_idx * tl.num_programs(1) + block_idx
+    pad_stride = num_reqs * tl.num_programs(1) * PAD_BLOCK_SIZE
+    for start in range(pad_program * PAD_BLOCK_SIZE, pad_count, pad_stride):
+        offsets = start + tl.arange(0, PAD_BLOCK_SIZE)
+        req = num_reqs + offsets
+        tl.store(out_query_start_loc_ptr + req, last_query_end, mask=req <= max_num_reqs)
+        tl.store(out_seq_lens_ptr + req, 0, mask=req < max_num_reqs)
+        # Padded sample indices refer to valid query row 0; mapping -1
+        # prevents the sampler from writing these rows to draft logits.
+        sample = sample_start + offsets
+        tl.store(out_sample_indices_ptr + sample, 0, mask=sample < sample_end)
+        tl.store(out_sample_pos_ptr + sample, 0, mask=sample < sample_end)
+        tl.store(out_sample_idx_mapping_ptr + sample, -1, mask=sample < sample_end)
+        query = last_query_end + offsets
+        tl.store(out_query_slot_mapping_ptr + query, PAD_SLOT_ID, mask=query < max_num_tokens)
