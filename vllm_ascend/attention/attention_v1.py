@@ -319,20 +319,50 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         """
         return {}
 
+    def _build_batch_metadata(
+        self,
+        common_attn_metadata: AscendCommonAttentionMetadata,
+        seq_lens: torch.Tensor,
+    ) -> dict[str, Any]:
+        num_reqs = common_attn_metadata.num_reqs
+        query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
+        num_decodes, num_prefills, num_decode_tokens, _ = self._split_decodes_and_prefills(common_attn_metadata)
+        query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
+        actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
+        seq_lens_list = seq_lens.tolist()
+        # FIA requires one KV length per query, including dummy padding requests.
+        padding_len = len(actual_seq_lengths_q) - len(seq_lens_list)
+        if padding_len > 0:
+            seq_lens_list = seq_lens_list + [1] * padding_len
+            seq_lens = torch.cat([seq_lens, seq_lens.new_ones(padding_len)])
+        return dict(
+            num_decode_tokens=num_decode_tokens,
+            num_prefills=num_prefills,
+            num_decodes=num_decodes,
+            query_start_loc=query_start_loc,
+            seq_lens=seq_lens,
+            seq_lens_cpu=seq_lens,
+            seq_lens_list=seq_lens_list,
+            actual_seq_lengths_q=actual_seq_lengths_q,
+        )
+
+    def build_for_cudagraph_capture(
+        self, common_attn_metadata: AscendCommonAttentionMetadata, **kwargs
+    ) -> AscendMetadata:
+        return self.build(common_prefix_len=0, common_attn_metadata=common_attn_metadata, **kwargs)
+
     def build(
         self,
         common_prefix_len: int,
         common_attn_metadata: AscendCommonAttentionMetadata,
         fast_build: bool = False,
+        *,
+        common_fia_metadata: dict[tuple, dict[str, Any]] | None = None,
     ) -> AscendMetadata:
         expanded_slot_mapping = common_attn_metadata.slot_mapping if self.pcp_enabled else None
         num_reqs = common_attn_metadata.num_reqs
         num_actual_tokens = common_attn_metadata.num_actual_tokens
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu[: num_reqs + 1]
-
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = self._split_decodes_and_prefills(
-            common_attn_metadata
-        )
 
         block_table = common_attn_metadata.block_table_tensor
 
@@ -343,6 +373,39 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             speculative_config=self.speculative_config,
             vllm_config=self.vllm_config,
         )
+        batch_metadata = None
+        if common_fia_metadata is not None:
+            # Scope sharing to compatible builders and identical length sources.
+            # The runner owns this dictionary for a single build invocation.
+            batch_key = (
+                type(self),
+                id(self.vllm_config),
+                self.decode_threshold,
+                self.pcp_enabled,
+                self.device,
+                num_reqs,
+                common_attn_metadata.num_actual_tokens,
+                common_attn_metadata.max_query_len,
+                query_start_loc_cpu.data_ptr(),
+                tuple(query_start_loc_cpu.shape),
+                query_start_loc_cpu.stride(),
+                query_start_loc_cpu.dtype,
+                seq_lens.data_ptr(),
+                tuple(seq_lens.shape),
+                seq_lens.stride(),
+                seq_lens.dtype,
+                seq_lens.device,
+                id(common_attn_metadata.is_prefilling),
+                id(common_attn_metadata.context_parallel_metadata),
+            )
+            batch_metadata = common_fia_metadata.get(batch_key)
+        if batch_metadata is None:
+            batch_metadata = self._build_batch_metadata(common_attn_metadata, seq_lens)
+            if common_fia_metadata is not None:
+                common_fia_metadata[batch_key] = batch_metadata
+        seq_lens = batch_metadata["seq_lens"]
+        num_decodes = batch_metadata["num_decodes"]
+        num_prefills = batch_metadata["num_prefills"]
         slot_mapping = common_attn_metadata.slot_mapping[:num_actual_tokens]
         # this slot_mapping override doesn't work since vllm will override it again. We should fix it vllm.
         # see: https://github.com/vllm-project/vllm/blob/ce88756b967c2c5006746a424c15dd59a284ed8c/vllm/model_executor/layers/attention/cross_attention.py#L117
@@ -354,36 +417,10 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         # Get attn_mask from singleton AttentionMaskBuilder
         attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
 
-        # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
-        query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
-
-        actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
-        seq_lens_list = seq_lens.tolist()
-        # Sequence-parallel (or cudagraph) padding makes the model runner insert a
-        # dummy padding request into query_start_loc to satisfy the FIA TND-layout
-        # constraint (sum of q lengths == hidden_states.shape[0]), bumping the
-        # q-derived batchSize by one. The query_start_loc buffer is sized
-        # `max_num_reqs + 2` to hold it, but the seq_lens and block_table buffers
-        # are only `max_num_reqs`, so when the batch is full the padded request
-        # overflows and `[:num_reqs_padded]` silently truncates them. FIA then
-        # fails (error 561002) checking, in order, the `actualSeqLengthsKv` length
-        # and then the block_table row count against batchSize. Pad them to match:
-        # the dummy request points at block 0, and its output is harmless because:
-        #   (1) read side: the attention output for padding tokens is trimmed by
-        #       `hidden_states = hidden_states[:-pad_size, :]` downstream;
-        #   (2) write side: reshape_and_cache slices key/value/slot_mapping to
-        #       `[:num_actual_tokens]` (unpadded count), so the dummy request
-        #       never writes to KV cache.
-        # So any valid positive KV length / zero block row is fine. Pad both
-        # seq_lens_list and the seq_lens tensor: full_graph_fia_v2 passes the
-        # seq_lens tensor (not seq_lens_list) as actual_seq_kvlen during graph
-        # capture, and _get_fia_params derives the PrefillCacheHit batch size from
-        # seq_lens.shape[0], so the tensor has to carry the dummy request too.
-        num_reqs_fia = len(actual_seq_lengths_q)
-        if len(seq_lens_list) < num_reqs_fia:
-            padding_len = num_reqs_fia - len(seq_lens_list)
-            seq_lens_list = seq_lens_list + [1] * padding_len
-            seq_lens = torch.cat([seq_lens, seq_lens.new_ones(padding_len)])
+        # Padding requests also need a block-table row for FIA. Keep physical
+        # blocks group-local; padding outputs are trimmed and KV writes only
+        # use num_actual_tokens, so a zero dummy row cannot write to the cache.
+        num_reqs_fia = len(batch_metadata["actual_seq_lengths_q"])
         if block_table is not None and block_table.shape[0] < num_reqs_fia:
             block_table = torch.cat(
                 [
@@ -403,23 +440,16 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         )
         attn_metadata = self.metadata_cls(
             num_actual_tokens=num_actual_tokens,
-            num_decode_tokens=num_decode_tokens,
             block_tables=block_table,
-            query_start_loc=query_start_loc,
             query_start_loc_gpu=common_attn_metadata.query_start_loc,
             seq_lens_gpu=common_attn_metadata.seq_lens,
-            seq_lens=seq_lens,
-            seq_lens_cpu=seq_lens,
-            seq_lens_list=seq_lens_list,
             max_query_len=common_attn_metadata.max_query_len,
-            actual_seq_lengths_q=actual_seq_lengths_q,
             slot_mapping=slot_mapping,
             attn_mask=attn_mask,
             attn_state=attn_state,
-            num_prefills=num_prefills,
-            num_decodes=num_decodes,
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
+            **batch_metadata,
             **backend_metadata,
         )
         if self.pcp_enabled:

@@ -16,7 +16,7 @@
 #
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
@@ -145,10 +145,13 @@ class AscendAttentionDCPMetadataBuilder(
         *,
         pcp_context: "AscendPCPAttentionContext | None" = None,
         pcp_cache_group_idx: int | None = None,
+        common_fia_metadata: dict[tuple, dict[str, Any]] | None = None,
     ) -> AscendAttentionDCPMetadata:
         self._pcp_context = pcp_context
         self._pcp_cache_group_idx = pcp_cache_group_idx
-        metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
+        metadata = super().build(
+            common_prefix_len, common_attn_metadata, fast_build, common_fia_metadata=common_fia_metadata
+        )
         assert isinstance(metadata, AscendAttentionDCPMetadata)
         return metadata
 

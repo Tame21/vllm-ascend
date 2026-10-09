@@ -58,7 +58,7 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
-from vllm_ascend.attention.attention_v1 import AscendAttentionState
+from vllm_ascend.attention.attention_v1 import AscendAttentionMetadataBuilder, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
 from vllm_ascend.attention.dsa_attn_kv_plan import get_dsa_attn_kv_plan
 from vllm_ascend.attention.dsa_v1 import AscendDSAMetadataBuilder
@@ -434,6 +434,7 @@ def build_attn_metadata(
     # Share request-level DSA metadata across cache groups in one execution.
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
     common_v41_batch_metadata: dict[str, Any] = {}
+    common_fia_metadata: dict[tuple, dict[str, Any]] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
     batch_tq_slots = uses_turboquant_groups(kv_cache_groups)
     formatted_slot_mappings = None
@@ -556,6 +557,8 @@ def build_attn_metadata(
                     # branches in the graph even for a short dummy sequence.
                     full_graph_mode=full_graph_mode or for_cudagraph_capture,
                 )
+            elif isinstance(attn_metadata_builder, AscendAttentionMetadataBuilder):
+                attn_metadata_extra_kwargs["common_fia_metadata"] = common_fia_metadata
             # Parallel attention and cache-only backends opt in to the PCP
             # context needed to construct their own metadata.
             if pcp_context is not None and (is_sfa_builder or is_dsa_builder or consumes_pcp_context):

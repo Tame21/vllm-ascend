@@ -26,6 +26,7 @@ from vllm_ascend.attention import utils as attention_utils
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
+    AscendAttentionMetadataBuilder,
     AscendAttentionState,
     AscendC8AttentionBackendImpl,
 )
@@ -1578,6 +1579,139 @@ class _CaptureStateBuilder(_PrefillStateBuilder):
     def build_for_cudagraph_capture(self, common_attn_metadata, **kwargs):
         self.extra_kwargs = kwargs
         return common_attn_metadata.is_prefilling
+
+
+def _make_fia_metadata_groups():
+    config = SimpleNamespace(model_config=SimpleNamespace(runner_type="generate"))
+    builders = []
+    for _ in range(3):
+        builder = AscendAttentionMetadataBuilder.__new__(AscendAttentionMetadataBuilder)
+        builder.vllm_config = config
+        builder.model_config = config.model_config
+        builder.kv_cache_spec = object()
+        builder.speculative_config = SimpleNamespace(parallel_drafting=True, use_dspark=lambda: False)
+        builder.decode_threshold = 4
+        builder.pcp_enabled = False
+        builder.device = torch.device("cpu")
+        builder.attn_mask_builder = MagicMock()
+        builder.attn_mask_builder.get_attention_mask.return_value = None
+        builders.append(builder)
+    groups = [
+        [SimpleNamespace(layer_names=[f"draft.{i}"], get_metadata_builder=lambda _, builder=builder: builder)]
+        for i, builder in enumerate(builders)
+    ]
+    kv_cache_config = SimpleNamespace(
+        kv_cache_groups=[SimpleNamespace(kv_cache_spec=builder.kv_cache_spec) for builder in builders]
+    )
+    return builders, groups, kv_cache_config
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+@pytest.mark.parametrize("with_padding", [False, True])
+def test_mrv2_fia_groups_share_conversions_and_rebuild_each_invocation(monkeypatch, for_capture, with_padding):
+    builders, groups, kv_cache_config = _make_fia_metadata_groups()
+    offsets = [0, 4, 8, 12] if with_padding else [0, 4, 8]
+    query_cpu = torch.tensor(offsets, dtype=torch.int32)
+    query_gpu = query_cpu.clone()
+    seq_lens = torch.tensor([20, 30], dtype=torch.int32)
+    block_tables = tuple(torch.full((2, 2), i, dtype=torch.int32) for i in range(3))
+    slot_mappings = tuple(torch.arange(offsets[-1], dtype=torch.int64) + i * 128 for i in range(3))
+    calls = dict(pin_memory=0, query_to_device=0, query_tolist=0, seq_tolist=0)
+    tensor_to = torch.Tensor.to
+    tensor_tolist = torch.Tensor.tolist
+    query_storage = query_cpu.untyped_storage().data_ptr()
+    seq_storage = seq_lens.untyped_storage().data_ptr()
+
+    def pin_memory(tensor, *args, **kwargs):
+        calls["pin_memory"] += 1
+        return tensor
+
+    def to(tensor, *args, **kwargs):
+        if tensor.untyped_storage().data_ptr() == query_storage:
+            calls["query_to_device"] += 1
+        return tensor_to(tensor, *args, **kwargs)
+
+    def tolist(tensor):
+        storage = tensor.untyped_storage().data_ptr()
+        if storage == query_storage:
+            calls["query_tolist"] += 1
+        if storage == seq_storage:
+            calls["seq_tolist"] += 1
+        return tensor_tolist(tensor)
+
+    monkeypatch.setattr(torch.Tensor, "pin_memory", pin_memory)
+    monkeypatch.setattr(torch.Tensor, "to", to)
+    monkeypatch.setattr(torch.Tensor, "tolist", tolist)
+    metadata_args = dict(
+        attn_groups=groups,
+        num_reqs=len(offsets) - 1,
+        num_actual_reqs=2,
+        num_tokens=offsets[-1],
+        num_actual_tokens=8,
+        query_start_loc_gpu=query_gpu,
+        query_start_loc_cpu=query_cpu,
+        max_query_len=4,
+        seq_lens=seq_lens,
+        max_seq_len=30,
+        block_tables=block_tables,
+        slot_mappings=slot_mappings,
+        kv_cache_config=kv_cache_config,
+        seq_lens_np=np.array([200, 300], dtype=np.int32),
+        attn_state=AscendAttentionState.SpecDecoding,
+        causal={0: False, 1: True, 2: False},
+        for_cudagraph_capture=for_capture,
+    )
+
+    first_metadata = attn_utils.build_attn_metadata(**metadata_args)
+
+    assert all(count == 1 for count in calls.values()), calls
+    metadata = list(first_metadata.values())
+    assert len({id(item) for item in metadata}) == len(groups)
+    assert len({id(item.qfa_metadata_cache) for item in metadata}) == len(groups)
+    assert len({id(item.seq_lens_list) for item in metadata}) == 1
+    assert len({id(item.actual_seq_lengths_q) for item in metadata}) == 1
+    for i, item in enumerate(metadata):
+        # Async DFlash must retain exact device lengths, rather than stale CPU
+        # upper bounds. A full request batch can also require one dummy row.
+        assert item.seq_lens_list == ([20, 30, 1] if with_padding else [20, 30])
+        assert item.actual_seq_lengths_q == offsets[1:]
+        assert item.seq_lens.shape[0] == len(offsets) - 1
+        torch.testing.assert_close(item.block_tables[:2], block_tables[i])
+        if with_padding:
+            torch.testing.assert_close(item.block_tables[2], torch.zeros(2, dtype=torch.int32))
+        else:
+            assert item.block_tables is block_tables[i]
+        assert item.slot_mapping.untyped_storage().data_ptr() == slot_mappings[i].untyped_storage().data_ptr()
+        assert item.slot_mapping.numel() == 8
+        assert item.query_start_loc_gpu is query_gpu
+        assert item.seq_lens_gpu.untyped_storage().data_ptr() == seq_storage
+        assert item.causal is (i == 1)
+        builders[i].attn_mask_builder.get_attention_mask.assert_called_once_with(i == 1, builders[i].model_config)
+
+    # Reuse the same buffers, as the runner does on the next draft/verify call.
+    # Pointer-based compatibility is safe only within the current invocation.
+    query_cpu[1] = 3
+    query_gpu.copy_(query_cpu)
+    seq_lens.copy_(torch.tensor([21, 34], dtype=torch.int32))
+    metadata_args.update(max_query_len=5, max_seq_len=34)
+
+    next_metadata = attn_utils.build_attn_metadata(**metadata_args)
+
+    assert all(count == 2 for count in calls.values()), calls
+    for i in range(3):
+        first = first_metadata[f"draft.{i}"]
+        current = next_metadata[f"draft.{i}"]
+        assert first.seq_lens_list == ([20, 30, 1] if with_padding else [20, 30])
+        assert first.actual_seq_lengths_q == offsets[1:]
+        assert current.seq_lens_list == ([21, 34, 1] if with_padding else [21, 34])
+        assert current.actual_seq_lengths_q == ([3, 8, 12] if with_padding else [3, 8])
+        assert (current.num_decodes, current.num_prefills, current.num_decode_tokens) == (
+            1,
+            2 if with_padding else 1,
+            3,
+        )
+        assert current.seq_lens_list is not first.seq_lens_list
+        assert current.qfa_metadata_cache is not first.qfa_metadata_cache
 
 
 @pytest.mark.parametrize("capture", [False, True])

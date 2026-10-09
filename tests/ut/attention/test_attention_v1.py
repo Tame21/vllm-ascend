@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 from vllm.config.compilation import CUDAGraphMode
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import CrossAttentionSpec, FullAttentionSpec
 
 import vllm_ascend.attention.attention_v1 as attn_module
 from tests.ut.base import TestBase
@@ -389,6 +389,93 @@ def test_pcp_builder_keeps_short_extend_in_prefill() -> None:
     )
 
     assert builder._split_decodes_and_prefills(common_metadata) == (0, 2, 0, 5)
+
+
+def _make_fia_sharing_builder(config, *, kv_cache_spec=None, parallel_drafting=False, decode_threshold=4):
+    builder = AscendAttentionMetadataBuilder.__new__(AscendAttentionMetadataBuilder)
+    builder.vllm_config = config
+    builder.model_config = config.model_config
+    builder.kv_cache_spec = kv_cache_spec
+    builder.speculative_config = (
+        SimpleNamespace(parallel_drafting=True, use_dspark=lambda: False) if parallel_drafting else None
+    )
+    builder.decode_threshold = decode_threshold
+    builder.pcp_enabled = False
+    builder.device = torch.device("cpu")
+    builder.attn_mask_builder = MagicMock()
+    builder.attn_mask_builder.get_attention_mask.return_value = None
+    return builder
+
+
+def _make_fia_sharing_common():
+    query_start_loc = torch.tensor([0, 4, 8], dtype=torch.int32)
+    return AscendCommonAttentionMetadata(
+        query_start_loc=query_start_loc.clone(),
+        query_start_loc_cpu=query_start_loc,
+        seq_lens=torch.tensor([20, 30], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([200, 300], dtype=torch.int32),
+        num_reqs=2,
+        num_actual_tokens=8,
+        max_query_len=4,
+        max_seq_len=30,
+        block_table_tensor=torch.zeros((2, 2), dtype=torch.int32),
+        slot_mapping=torch.arange(10, dtype=torch.int64),
+        attn_state=AscendAttentionState.SpecDecoding,
+    )
+
+
+def test_fia_sharing_keeps_cpu_and_exact_device_length_sources_separate(monkeypatch):
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    config = SimpleNamespace(model_config=SimpleNamespace(runner_type="generate"))
+    common = _make_fia_sharing_common()
+    builders = [
+        _make_fia_sharing_builder(config),
+        _make_fia_sharing_builder(
+            config,
+            kv_cache_spec=CrossAttentionSpec(block_size=16, num_kv_heads=1, head_size=128, dtype=torch.float16),
+        ),
+        _make_fia_sharing_builder(config, parallel_drafting=True),
+    ]
+    shared = {}
+
+    cpu_metadata, cross_metadata, dflash_metadata = [
+        builder.build(0, common, common_fia_metadata=shared) for builder in builders
+    ]
+
+    assert len(shared) == 2
+    assert cpu_metadata.seq_lens_list == [200, 300]
+    assert cross_metadata.seq_lens_list == [20, 30]
+    assert dflash_metadata.seq_lens_list is cross_metadata.seq_lens_list
+    assert cpu_metadata.seq_lens_list is not dflash_metadata.seq_lens_list
+    assert dflash_metadata.actual_seq_lengths_q is cross_metadata.actual_seq_lengths_q
+    # Cross-attention still owns its complete int32 slot mapping, even when
+    # its request lengths share the same conversion as the DFlash builder.
+    assert cross_metadata.slot_mapping.dtype == torch.int32
+    assert cross_metadata.slot_mapping.numel() == common.slot_mapping.numel()
+    assert dflash_metadata.slot_mapping.dtype == torch.int64
+    assert dflash_metadata.slot_mapping.numel() == common.num_actual_tokens
+    assert cpu_metadata.qfa_metadata_cache is not cross_metadata.qfa_metadata_cache
+    assert cross_metadata.qfa_metadata_cache is not dflash_metadata.qfa_metadata_cache
+
+
+def test_fia_sharing_separates_decode_classification_thresholds(monkeypatch):
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    config = SimpleNamespace(model_config=SimpleNamespace(runner_type="generate"))
+    common = _make_fia_sharing_common()
+    shared = {}
+    decode_builder = _make_fia_sharing_builder(config, parallel_drafting=True)
+    prefill_builder = _make_fia_sharing_builder(config, parallel_drafting=True, decode_threshold=3)
+
+    decode_metadata = decode_builder.build(0, common, common_fia_metadata=shared)
+    prefill_metadata = prefill_builder.build(0, common, common_fia_metadata=shared)
+
+    assert len(shared) == 2
+    assert (decode_metadata.num_decodes, decode_metadata.num_prefills, decode_metadata.num_decode_tokens) == (2, 0, 8)
+    assert (prefill_metadata.num_decodes, prefill_metadata.num_prefills, prefill_metadata.num_decode_tokens) == (
+        0,
+        2,
+        0,
+    )
 
 
 class TestAscendAttentionBackendImpl(TestBase):
