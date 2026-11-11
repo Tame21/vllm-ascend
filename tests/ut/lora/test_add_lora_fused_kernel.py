@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Extensive numeric tests for the fused add_lora kernel (z1 + z2).
+"""Numeric tests for fused add_lora (z1 + z2) and its BGMV decode fallback.
 
 Kernel under test: csrc/kernels/add_lora_fused.cpp, reached through
 PunicaWrapperNPU.add_lora -> torch.ops._C_ascend.add_lora with the decode
-(use_gmm=False) dispatch, fused kernel enabled.
+(use_gmm=False) dispatch, with fused and BGMV-preferred cases.
 
 Semantics tested (add == accumulate, overwrite == add_inputs=False):
     y[t, col_s : col_s + h2_s] (+)= ((x[t] @ A_s[slot]^T * scale) @ B_s[slot]^T)
@@ -76,12 +76,12 @@ class _BareWrapper(PunicaWrapperNPU):
         self._test_token_lora_indices = value
 
 
-def _make_wrapper() -> PunicaWrapperNPU:
-    """Bare wrapper: decode dispatch, fused kernel enabled, flags only."""
+def _make_wrapper(use_add_lora=True) -> PunicaWrapperNPU:
+    """Bare wrapper: decode dispatch, flags only."""
     wrapper = object.__new__(_BareWrapper)
     wrapper._use_gmm_shrink_cpu = torch.tensor(False, dtype=torch.bool)
     wrapper._no_lora_cpu = torch.tensor(False, dtype=torch.bool)
-    wrapper._use_add_lora_cpu = torch.tensor(True, dtype=torch.bool)
+    wrapper._use_add_lora_cpu = torch.tensor(use_add_lora, dtype=torch.bool)
     return wrapper
 
 
@@ -134,8 +134,8 @@ def _reference(y0, x, a, b, mapping, h2s, scale, add_inputs, offset=0):
     return ref
 
 
-def _apply(y, x, a, b, mapping, h2s, *, scale=1.0, add_inputs=True, offset_start=0):
-    wrapper = _make_wrapper()
+def _apply(y, x, a, b, mapping, h2s, *, scale=1.0, add_inputs=True, offset_start=0, use_add_lora=True):
+    wrapper = _make_wrapper(use_add_lora=use_add_lora)
     wrapper.token_lora_indices = mapping
     wrapper.add_lora(
         y,
@@ -321,6 +321,55 @@ def test_determinism_two_launches():
 
 
 # ------------------------------------------------- fallback-path numerics ---
+
+
+@pytest.mark.parametrize("add_inputs", [True, False])
+@pytest.mark.parametrize("offset", [0, 32])
+@pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float16])
+def test_decode_bgmv_preserves_slice_and_no_adapter_semantics(add_inputs, offset, dtype):
+    h2s = (128, 256)
+    slots = [0, -1, 1, 1, -1, 0, 2, -1]
+    x, y0, a, b, mapping = _make_case(8, 1024, 16, h2s, slots, dtype, seed=91, y_width_extra=offset + 16)
+    y = _apply(
+        y0.clone(),
+        x,
+        a,
+        b,
+        mapping,
+        h2s,
+        scale=0.25,
+        add_inputs=add_inputs,
+        offset_start=offset,
+        use_add_lora=False,
+    )
+    ref = _reference(y0, x, a, b, mapping, h2s, 0.25, add_inputs, offset)
+    torch.testing.assert_close(y.float(), ref, atol=REF_TOL, rtol=0)
+    end = offset + sum(h2s)
+    assert torch.equal(y[:, :offset], y0[:, :offset])
+    assert torch.equal(y[:, end:], y0[:, end:])
+    inactive = mapping < 0
+    if add_inputs:
+        assert torch.equal(y[inactive], y0[inactive])
+    else:
+        assert torch.count_nonzero(y[inactive, offset:end]).item() == 0
+
+
+@pytest.mark.parametrize("add_inputs", [True, False])
+@pytest.mark.parametrize("h1,rank,h2", [(16, 16, 32), (16, 32, 64), (64, 32, 16)])
+def test_decode_bgmv_falls_back_for_unsupported_projection_dims(add_inputs, h1, rank, h2):
+    slots = [0, -1, 1, 1, -1, 0, 2, -1]
+    h2s = (h2,)
+    x, y0, a, b, mapping = _make_case(8, h1, rank, h2s, slots, torch.bfloat16, seed=102, y_width_extra=16)
+    y = _apply(y0.clone(), x, a, b, mapping, h2s, add_inputs=add_inputs, use_add_lora=False)
+    ref = _reference(y0, x, a, b, mapping, h2s, 1.0, add_inputs)
+    torch.testing.assert_close(y.float(), ref, atol=REF_TOL, rtol=0)
+    assert torch.equal(y[:, h2:], y0[:, h2:])
+    inactive = mapping < 0
+    if add_inputs:
+        assert torch.equal(y[inactive], y0[inactive])
+    else:
+        assert torch.count_nonzero(y[inactive, :h2]).item() == 0
+
 
 # configs add_lora_eligible must reject where the bgmv fallback is a sound
 # substitute; the TEST ONLY asserts correct numerics, never which path ran

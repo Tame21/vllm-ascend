@@ -471,6 +471,9 @@ def lora_linear(
     add_inputs: bool,
 ) -> None:
     wrapper = _LORA_WRAPPERS[wrapper_id]
+    if wrapper._single_lora_slot and not wrapper._use_gmm_shrink_cpu.item():
+        if wrapper._try_lora_linear_bgmv(y, x, lora_a_stacked, lora_b_stacked, scale, output_slices, add_inputs):
+            return
     packed = len(lora_a_stacked) == 1 or (packed_lora_a is not None and packed_lora_b is not None)
     use_kernel = not wrapper._single_lora_slot or not packed
     if use_kernel:

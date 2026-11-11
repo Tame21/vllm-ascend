@@ -830,10 +830,13 @@ void add_lora_expand(at::Tensor y, std::vector<at::Tensor> x, std::vector<at::Te
             }
             offset += size;
         }
-    } else {                      // decode -> bgmv (always accumulates into y)
+    } else {                      // decode -> bgmv
         for (size_t s = 0; s < lora_b.size(); ++s) {
             int64_t size = output_slices[s];
             at::Tensor idx = match_rows(token_lora_indices, x[s].size(0));
+            if (!add_inputs) {
+                y.slice(1, offset, offset + size).zero_();
+            }
             bgmv_expand(x[s], lora_b[s], idx, y, offset, size);
             offset += size;
         }
@@ -1143,7 +1146,19 @@ void add_lora(at::Tensor y, at::Tensor x, std::vector<at::Tensor> lora_a,
         size_ok = x.size(0) <= kAddLoraDecodeMaxTokens
                   || (lora_a.size() >= 2 && x.size(0) <= kAddLoraDecodeMaxMergedTokens);
     }
-    const bool want_fused = use_add_lora.item<bool>() && size_ok;
+    bool bgmv_requires_fused_fallback = false;
+    if (!prefill) {
+        for (size_t s = 0; s < lora_a.size(); ++s) {
+            const int64_t rank = lora_a[s].size(2);
+            if (x.size(1) <= rank || output_slices[s] < rank) {
+                bgmv_requires_fused_fallback = true;
+                break;
+            }
+        }
+    }
+    // A disabled use_add_lora prefers BGMV for decode, but its shrink/expand
+    // cannot handle these dimensions. Keep the eligible fused fallback.
+    const bool want_fused = (use_add_lora.item<bool>() || bgmv_requires_fused_fallback) && size_ok;
     const char* reason = nullptr;
     bool eligible = want_fused &&
         add_lora_eligible(y, x, lora_a, lora_b, output_slices, offset_start, &reason);

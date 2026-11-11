@@ -17,8 +17,10 @@ from vllm_ascend.lora.lora_ops import _LORA_WRAPPER_IDS, _LORA_WRAPPERS, lora_li
 from vllm_ascend.lora.utils import refresh_all_lora_classes
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
-# in-tree fused kernel for decode
+# Prefer fusion for prefill; unsupported decode shapes retain the native fallback.
 ENABLE_ADD_LORA_KERNEL = True
+_BGMV_SUPPORTED_RANKS = (8, 16, 32, 64)
+_BGMV_ROW_ALIGNMENT = 16
 
 
 def build_combined_lora_idx(
@@ -113,13 +115,13 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._prefill_meta_ready = False
         self._use_moe_gmm_cpu = torch.tensor(False, dtype=torch.bool)
 
-        # switch for fused addlora kernel
-        self._use_add_lora_cpu = torch.tensor(ENABLE_ADD_LORA_KERNEL, dtype=torch.bool)
+        # Decode uses BGMV; update_metadata enables fusion for prefill.
+        self._use_add_lora_cpu = torch.tensor(False, dtype=torch.bool)
         # In the previous punica_npu code there were no switch between prefill/decode,
         # everything was processed via SGMV kernels. GroupGEMM on prefill is generally
         # much faster, but kernel launch takes way to much time for using it for decode,
         # so we temporarily use the serving tokens number switch to distinguish
-        # prefill GroupGEMM and decode BGMV/fused addlora
+        # prefill GroupGEMM and decode BGMV
         self.gmm_threshold = (
             int(os.environ["LORA_GMM_THRESHOLD"]) if "LORA_GMM_THRESHOLD" in os.environ else max_batches
         )
@@ -194,6 +196,7 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self._no_lora_cpu.fill_(self.no_lora)
 
         self._use_moe_gmm_cpu.fill_(gmm_enabled)
+        self._use_add_lora_cpu.fill_(ENABLE_ADD_LORA_KERNEL and gmm_enabled)
 
         self.is_prefill = bool(getattr(mapping, "is_prefill", True))
         self._prefill_meta_ready = gmm_enabled
@@ -318,10 +321,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
     ) -> None:
         """
         Performs the full `y += (x @ lora_a) @ lora_b * scale` LoRA apply in a
-        single opaque op. Inside the op: in-tree fused kernel (decode and
-        small prefill, option-gated) or gmm; decode fallback -> bgmv
-        shrink+expand pair. add_inputs=False is emulated by zeroing the
-        target slice first (the fused kernel always accumulates).
+        single opaque op. Decode prefers BGMV shrink+expand, retaining fusion
+        for unsupported projection dimensions. The prefill branch can use
+        fusion or GMM. add_inputs=False clears the target slice before BGMV.
         """
         y2d = y.view(-1, y.shape[-1])
         x2d = x.view(-1, x.shape[-1])
@@ -383,9 +385,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         if buffer is None:
             if self._single_lora_slot and not self.no_lora:
-                # Single active adapter: the registry dispatch routes to a
-                # plain matmul with the adapter mask (or the triton packed
-                # path on A3), which beats the generic punica/fused dispatch.
+                # Keep decode BGMV and the single-adapter prefill paths
+                # inside the opaque registry op for graph capture.
                 lora_linear(
                     self._wrapper_id,
                     y,
@@ -436,6 +437,68 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         buffer = self._get_shrink_buffer(len(slices), x.size(0), r, x.device)
         self.add_shrink(buffer, x, lora_a, scale)
         self.add_expand(y, buffer, lora_b, slices, add_inputs=True)
+
+    def _try_lora_linear_bgmv(
+        self,
+        y: torch.Tensor,
+        x: torch.Tensor,
+        lora_a_stacked: tuple[torch.Tensor, ...] | list[torch.Tensor],
+        lora_b_stacked: tuple[torch.Tensor, ...] | list[torch.Tensor],
+        scale: float,
+        output_slices: tuple[int, ...] | list[int],
+        add_inputs: bool,
+    ) -> bool:
+        """Apply single-slot decode with BGMV when its native kernels support the shape."""
+        x = x.view(-1, x.shape[-1])
+        y = y.view(-1, y.shape[-1])
+        if not lora_a_stacked or not (len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)):
+            return False
+        rank = lora_b_stacked[0].shape[-1]
+        # The expand reduction implements these ranks, and both kernels
+        # require aligned rows. Keep the existing fallback for other shapes.
+        if (
+            rank not in _BGMV_SUPPORTED_RANKS
+            or x.dtype not in (torch.float16, torch.bfloat16)
+            or y.dtype != x.dtype
+            or not x.is_contiguous()
+            or not y.is_contiguous()
+            or x.shape[-1] <= rank
+            or x.shape[-1] % _BGMV_ROW_ALIGNMENT
+            or y.shape[-1] % _BGMV_ROW_ALIGNMENT
+            or sum(output_slices) > y.shape[-1]
+        ):
+            return False
+        for a, b, width in zip(lora_a_stacked, lora_b_stacked, output_slices):
+            if (
+                a.shape[-2:] != (rank, x.shape[-1])
+                or b.shape[-1] != rank
+                or b.shape[-2] < width
+                or width < rank
+                or width % _BGMV_ROW_ALIGNMENT
+                or a.dtype != x.dtype
+                or b.dtype != x.dtype
+                or not a.is_contiguous()
+                or not b.is_contiguous()
+            ):
+                return False
+
+        num_tokens = x.shape[0]
+        if num_tokens == 0:
+            return True
+        indices = self.token_lora_indices[:num_tokens]
+        if indices.numel() < num_tokens:
+            indices = torch.cat((indices, indices.new_full((num_tokens - indices.numel(),), -1)))
+        buffers = self._get_shrink_buffer(len(output_slices), num_tokens, rank, x.device)
+        if not add_inputs:
+            y[:, : sum(output_slices)].zero_()
+        offset = 0
+        for a, b, width, buffer in zip(lora_a_stacked, lora_b_stacked, output_slices, buffers):
+            # BGMV skips inactive rows; clear reused storage before every call.
+            buffer.zero_()
+            self.bgmv_shrink(x, a, buffer, indices, scale)
+            self.bgmv_expand_slice(buffer, b, y, indices, offset, width, add_inputs=True)
+            offset += width
+        return True
 
     def _get_shrink_buffer(
         self,

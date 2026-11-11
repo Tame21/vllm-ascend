@@ -49,9 +49,11 @@ Without this flag, tensor parallelism shards only part of the LoRA computation. 
 
 ## Performance
 
-**Single-slot fast path.** On Atlas A2 and Atlas A3, `--max-loras 1`, `--fully-sharded-loras` left off, BF16 weights, a rank in {8, 16, 32, 64}, and at most 128 tokens select two kernels. Shrink splits the long input dimension (split-K) so more compute units work on a small token count. Expand is fused: it reduces those partials, applies the adapter mask and scale, multiplies by B, and adds the delta into the base output in one launch. More than one active adapter, `--fully-sharded-loras`, or a rank outside that set stays on the general SGMV/BGMV path.
+**Decode kernels.** Batches at or below `LORA_GMM_THRESHOLD` prefer BGMV shrink and expand. Projection dimensions unsupported by BGMV retain the existing fused-kernel fallback. The threshold defaults to `max_num_seqs` and is multiplied by `1 + num_speculative_tokens` for speculative decoding. Larger batches keep the prefill dispatch.
 
-**Fully sharded LoRA.** Add `--fully-sharded-loras` when partial sharding is the limiter. This path does not use the fused single-slot kernels above.
+**Single-slot fast path.** On Atlas A2 and Atlas A3, `--max-loras 1` with `--fully-sharded-loras` left off also uses BGMV for these small batches. FP16/BF16 projections with rank in {8, 16, 32, 64} and supported aligned dimensions take this path, including attention and shared-expert projections. Unsupported shapes retain the existing Triton/matmul or general-kernel fallback. Larger batches retain the existing single-slot prefill path.
+
+**Fully sharded LoRA.** Add `--fully-sharded-loras` when partial sharding is the limiter. This path keeps the separate shrink, cross-rank communication, and expand operations.
 
 ## Usage Example
 
